@@ -2712,7 +2712,7 @@
                 "description": "Inbound mail for every address at the domain (a catch-all), readable at /emails/receiving and announced by the email.received webhook. Enabling needs a verified domain on an instance that receives mail, and adds a Receiving MX record to records[]. A domain that already has mailboxes is best received on a subdomain (inbound.example.com): the Receiving MX would take their mail."
               }
             },
-            "description": "Resend's domain capabilities; omitted fields keep their value."
+            "description": "What the domain is used for (sending, receiving); omitted fields keep their value."
           }
         },
         "required": [
@@ -3381,7 +3381,7 @@
                 "description": "Inbound mail for every address at the domain (a catch-all), readable at /emails/receiving and announced by the email.received webhook. Enabling needs a verified domain on an instance that receives mail, and adds a Receiving MX record to records[]. A domain that already has mailboxes is best received on a subdomain (inbound.example.com): the Receiving MX would take their mail."
               }
             },
-            "description": "Resend's domain capabilities; omitted fields keep their value."
+            "description": "What the domain is used for (sending, receiving); omitted fields keep their value."
           },
           "receiving_catch_all": {
             "type": "boolean",
@@ -3647,7 +3647,7 @@
           },
           "signing_secret": {
             "type": "string",
-            "description": "Signing secret to use instead of minting one: whsec_ followed by base64 of 24-64 bytes, the format Resend/Svix issue. An existing secret carried over keeps the receiver verifying unchanged; when omitted, a new one is generated."
+            "description": "Signing secret to use instead of minting one: whsec_ followed by base64 of 24-64 bytes (the Standard Webhooks format). An existing secret carried over keeps the receiver verifying unchanged; when omitted, a new one is generated."
           }
         },
         "required": [
@@ -10604,7 +10604,7 @@
       "get": {
         "operationId": "contacts.list",
         "summary": "List contacts",
-        "description": "Newest first, as on Resend, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
+        "description": "Newest first, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
         "parameters": [
           {
             "schema": {
@@ -10643,10 +10643,10 @@
           {
             "schema": {
               "type": "string",
-              "description": "BillionSend extension: comma-separated facets attached to every item — `properties` (the {type, value} map GET /contacts/{id} returns) and `topics` (the rows GET /contacts/{id}/topics returns). Omitted, each item has the Resend shape."
+              "description": "Comma-separated facets attached to every item — `properties` (the {type, value} map GET /contacts/{id} returns) and `topics` (the rows GET /contacts/{id}/topics returns). Omitted, each item has only the contact fields."
             },
             "required": false,
-            "description": "BillionSend extension: comma-separated facets attached to every item — `properties` (the {type, value} map GET /contacts/{id} returns) and `topics` (the rows GET /contacts/{id}/topics returns). Omitted, each item has the Resend shape.",
+            "description": "Comma-separated facets attached to every item — `properties` (the {type, value} map GET /contacts/{id} returns) and `topics` (the rows GET /contacts/{id}/topics returns). Omitted, each item has only the contact fields.",
             "name": "include",
             "in": "query"
           }
@@ -10816,7 +10816,7 @@
       "post": {
         "operationId": "contacts.batch.remove",
         "summary": "Delete in bulk",
-        "description": "BillionSend extension (Resend deletes contacts one at a time): deletes up to 1000 contacts by id or by email address in one request and lists the rows actually deleted; unknown ids or addresses are skipped. Emails stay in the log; `erase: true` also scrubs each address from email history, event payloads and API logs, like DELETE /contacts/{id}?erase=true.",
+        "description": "Deletes up to 1000 contacts by id or by email address in one request and lists the rows actually deleted; unknown ids or addresses are skipped. Emails stay in the log; `erase: true` also scrubs each address from email history, event payloads and API logs, like DELETE /contacts/{id}?erase=true.",
         "requestBody": {
           "required": true,
           "content": {
@@ -10904,7 +10904,7 @@
       "post": {
         "operationId": "contacts.batch.create",
         "summary": "Create in bulk",
-        "description": "BillionSend extension: creates up to 1000 contacts in one request (Resend imports contacts only via CSV). Each item is a CreateContactRequest. `on_conflict` decides what happens to an email that already belongs to a contact — `error` (default), `skip`, or `upsert`. An upsert updates `first_name`/`last_name` only when provided, merges `properties` (provided keys overwrite), adds `segments` and upserts `topics`. `unsubscribed: true` opts the contact out; `unsubscribed: false` on an already unsubscribed contact is ignored — a batch never re-subscribes anyone, that stays an explicit PATCH /contacts/{id}. The `x-batch-validation` header picks strict (default, all-or-nothing) or permissive (valid subset written, failures listed in `errors`).",
+        "description": "Creates up to 1000 contacts in one request. Each item is a CreateContactRequest. `on_conflict` decides what happens to an email that already belongs to a contact — `error` (default), `skip`, or `upsert`. An upsert updates `first_name`/`last_name` only when provided, merges `properties` (provided keys overwrite), adds `segments` and upserts `topics`. `unsubscribed: true` opts the contact out; `unsubscribed: false` on an already unsubscribed contact is ignored — a batch never re-subscribes anyone, that stays an explicit PATCH /contacts/{id}. The `x-batch-validation` header picks strict (default, all-or-nothing) or permissive (valid subset written, failures listed in `errors`).",
         "parameters": [
           {
             "schema": {
@@ -12463,7 +12463,7 @@
       "get": {
         "operationId": "contactProperties.list",
         "summary": "List properties",
-        "description": "Newest first, as on Resend, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
+        "description": "Newest first, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
         "parameters": [
           {
             "schema": {
@@ -12962,7 +12962,7 @@
       "get": {
         "operationId": "segments.list",
         "summary": "List segments",
-        "description": "Newest first, as on Resend, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
+        "description": "Newest first, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
         "parameters": [
           {
             "schema": {
@@ -13391,7 +13391,7 @@
       "get": {
         "operationId": "segments.contacts.list",
         "summary": "List segment contacts",
-        "description": "Newest first, as on Resend, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
+        "description": "Newest first, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
         "parameters": [
           {
             "schema": {
@@ -13439,10 +13439,10 @@
           {
             "schema": {
               "type": "string",
-              "description": "BillionSend extension: comma-separated facets attached to every item — `properties` (the {type, value} map GET /contacts/{id} returns) and `topics` (the rows GET /contacts/{id}/topics returns). Omitted, each item has the Resend shape."
+              "description": "Comma-separated facets attached to every item — `properties` (the {type, value} map GET /contacts/{id} returns) and `topics` (the rows GET /contacts/{id}/topics returns). Omitted, each item has only the contact fields."
             },
             "required": false,
-            "description": "BillionSend extension: comma-separated facets attached to every item — `properties` (the {type, value} map GET /contacts/{id} returns) and `topics` (the rows GET /contacts/{id}/topics returns). Omitted, each item has the Resend shape.",
+            "description": "Comma-separated facets attached to every item — `properties` (the {type, value} map GET /contacts/{id} returns) and `topics` (the rows GET /contacts/{id}/topics returns). Omitted, each item has only the contact fields.",
             "name": "include",
             "in": "query"
           }
@@ -13669,7 +13669,7 @@
       "get": {
         "operationId": "broadcasts.list",
         "summary": "List broadcasts",
-        "description": "Newest first, as on Resend, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
+        "description": "Newest first, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
         "parameters": [
           {
             "schema": {
@@ -15040,7 +15040,7 @@
       "get": {
         "operationId": "domains.list",
         "summary": "List domains",
-        "description": "Newest first, as on Resend, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones. The team's subdomain of the shared domain, when it has one, is the last row (`shared: true`).",
+        "description": "Newest first, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones. The team's subdomain of the shared domain, when it has one, is the last row (`shared: true`).",
         "parameters": [
           {
             "schema": {
@@ -15702,7 +15702,7 @@
       "get": {
         "operationId": "apiKeys.list",
         "summary": "List API keys",
-        "description": "Newest first, as on Resend, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones. A key held to one domain lists only the keys held to that same domain.",
+        "description": "Newest first, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones. A key held to one domain lists only the keys held to that same domain.",
         "parameters": [
           {
             "schema": {
@@ -16005,7 +16005,7 @@
       "get": {
         "operationId": "webhooks.list",
         "summary": "List webhooks",
-        "description": "Newest first, as on Resend, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
+        "description": "Newest first, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
         "parameters": [
           {
             "schema": {
@@ -16530,7 +16530,7 @@
         },
         "responses": {
           "200": {
-            "description": "One entry per distinct address (case-insensitive) in input order; addresses already suppressed return their existing id and keep their origin. New rows record the request's origin (bounce, complaint or manual; default manual). Accepts up to 1000 addresses (Resend: 100).",
+            "description": "One entry per distinct address (case-insensitive) in input order; addresses already suppressed return their existing id and keep their origin. New rows record the request's origin (bounce, complaint or manual; default manual). Accepts up to 1000 addresses.",
             "content": {
               "application/json": {
                 "schema": {
@@ -16777,7 +16777,7 @@
       "get": {
         "operationId": "suppressions.list",
         "summary": "List suppressions",
-        "description": "Newest first, as on Resend, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
+        "description": "Newest first, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
         "parameters": [
           {
             "schema": {
@@ -17080,7 +17080,7 @@
       "get": {
         "operationId": "unsubscribes.list",
         "summary": "List unsubscribes",
-        "description": "Newest first, as on Resend, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
+        "description": "Newest first, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
         "parameters": [
           {
             "schema": {
@@ -17508,7 +17508,7 @@
       "get": {
         "operationId": "templates.list",
         "summary": "List templates",
-        "description": "Newest first, as on Resend, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
+        "description": "Newest first, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
         "parameters": [
           {
             "schema": {
@@ -18404,7 +18404,7 @@
       "get": {
         "operationId": "verifications.list",
         "summary": "List verifications",
-        "description": "Newest first, as on Resend, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
+        "description": "Newest first, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
         "parameters": [
           {
             "schema": {
@@ -19565,7 +19565,7 @@
       "get": {
         "operationId": "inboxes.agent.get",
         "summary": "Get agent settings",
-        "description": "Resend's hosted-agent settings. BillionSend runs no agent of its own, so an inbox never has one.",
+        "description": "Hosted-agent settings. BillionSend runs no agent of its own, so an inbox never has one.",
         "parameters": [
           {
             "schema": {
@@ -22621,7 +22621,7 @@
       "post": {
         "operationId": "inboxes.send",
         "summary": "Send an email from an inbox",
-        "description": "BillionSend extension, with no Resend counterpart: sends a new conversation from the inbox address in one call (`to`, `subject`, `html` and/or `text`, optional `cc`, `bcc` and `attachments` as POST /emails takes them). It runs the same rules as a reply: an inbox that may not start conversations, a first-time recipient past the ramp, or `requires_approval: true` keeps it as a draft for a person to approve and the answer is 202 with the Draft. Accepts an `Idempotency-Key`. An inbox on the shared domain takes no attachments.",
+        "description": "Sends a new conversation from the inbox address in one call (`to`, `subject`, `html` and/or `text`, optional `cc`, `bcc` and `attachments` as POST /emails takes them). It runs the same rules as a reply: an inbox that may not start conversations, a first-time recipient past the ramp, or `requires_approval: true` keeps it as a draft for a person to approve and the answer is 202 with the Draft. Accepts an `Idempotency-Key`. An inbox on the shared domain takes no attachments.",
         "parameters": [
           {
             "schema": {
@@ -24638,7 +24638,7 @@
       "get": {
         "operationId": "emails.list",
         "summary": "List emails",
-        "description": "Newest first, as on Resend, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
+        "description": "Newest first, with cursor pagination: `after` takes the last id of a page and pages toward older items, `before` takes the first id and pages back toward newer ones.",
         "parameters": [
           {
             "schema": {
@@ -25360,7 +25360,7 @@
       "get": {
         "operationId": "emails.receiving.list",
         "summary": "List received emails",
-        "description": "Mail received at the team's receiving domains and inboxes, newest first like Resend (`after` pages toward older mail), with cursor pagination. Needs a full access key; a domain-scoped key lists mail addressed to its domain only, an inbox-scoped key mail delivered into its inbox. Mail held for screening or in quarantine is left out unless a full access key asks for it (include_quarantined, quarantined). With wait, the request is held until matching mail arrives (long-poll). An inbox_id the key can't reach answers 404 at once, without waiting; an inbox-scoped key naming another inbox gets 403 restricted_api_key. Everything in a received email was written by whoever sent it, so its HTML is safe to show only in a sandbox.",
+        "description": "Mail received at the team's receiving domains and inboxes, newest first (`after` pages toward older mail), with cursor pagination. Needs a full access key; a domain-scoped key lists mail addressed to its domain only, an inbox-scoped key mail delivered into its inbox. Mail held for screening or in quarantine is left out unless a full access key asks for it (include_quarantined, quarantined). With wait, the request is held until matching mail arrives (long-poll). An inbox_id the key can't reach answers 404 at once, without waiting; an inbox-scoped key naming another inbox gets 403 restricted_api_key. Everything in a received email was written by whoever sent it, so its HTML is safe to show only in a sandbox.",
         "parameters": [
           {
             "schema": {
