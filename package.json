@@ -1,0 +1,48 @@
+{
+  "name": "@billionsend/cli",
+  "version": "0.2.4",
+  "description": "Migrate an email account to BillionSend: contacts, segments, topics, templates, webhooks, domains and suppressions — read from the source provider, written to your BillionSend account, re-run safe",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "billionsend": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/billionsend/billionsend-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/billionsend/billionsend-cli/issues"
+  },
+  "homepage": "https://billionsend.com/docs/cli",
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "packageManager": "pnpm@11.11.0",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --format=esm --outfile=dist/index.js --banner:js='#!/usr/bin/env node' --define:__CLI_VERSION__=\"\\\"$npm_package_version\\\"\"",
+    "prepublishOnly": "pnpm build",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "test": "vitest run",
+    "openapi:sync": "node scripts/sync-openapi.mjs"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.15",
+    "@types/node": "^24.19.2",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}

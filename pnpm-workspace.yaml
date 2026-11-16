@@ -1,0 +1,4 @@
+allowBuilds:
+  esbuild: true
+# Supply-chain: only install package versions published at least 24h ago.
+minimumReleaseAge: 1440
