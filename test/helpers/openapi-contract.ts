@@ -179,7 +179,13 @@ export function checkRequest(
       const validate = validatorAt(
         `${matched.pointer}/requestBody/content/application~1json/schema`,
       );
-      if (!validate(body)) bodyProblems.push(...describe(validate.errors, ""));
+      // A batch (an operation taking x-batch-validation) checks each item itself, so that header
+      // can decide between failing the batch and listing the item: item errors are its handler's.
+      const perItem = params.some((p) => p.in === "header" && p.name === "x-batch-validation");
+      const errors = validate(body)
+        ? []
+        : (validate.errors ?? []).filter((e) => !(perItem && /^\/\d+(\/|$)/.test(e.instancePath)));
+      if (errors.length > 0) bodyProblems.push(...describe(errors, ""));
     }
   } else if (hasBody) {
     problems.push("the operation documents no request body");
