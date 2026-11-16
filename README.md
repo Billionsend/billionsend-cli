@@ -74,6 +74,15 @@ The tests never reach a real account. The source side is a fake account (`test/h
 
 `pnpm openapi:sync` refreshes the snapshot from https://billionsend.com/docs/api.openapi.json (`-- --from <file|url>` takes another source, `-- --check` only compares); run the tests after it, and what fails is what the CLI has to follow. CI compares the snapshot with the published document every week.
 
+## Releasing
+
+Publishing is manual; nothing is published on push.
+
+1. Set `version` in `package.json`, commit, then tag and push: `git tag v0.2.4 && git push origin main v0.2.4`.
+2. The first version only: a member of the `@billionsend` npm organization publishes from a clean checkout of the tag, with two-factor authentication: `pnpm install --frozen-lockfile && pnpm typecheck && pnpm lint && pnpm test && npm publish` (`prepublishOnly` builds the bundle; `publishConfig.access` is `public`).
+3. Once the package exists: on npmjs.com, `@billionsend/cli` → Settings → Trusted Publisher → GitHub Actions, repository `billionsend/billionsend-cli`, workflow `release.yml`.
+4. Every later version: Actions → `release` → Run workflow, on the version tag. The workflow refuses a branch or a tag that differs from `package.json`, runs every check, and publishes with npm Trusted Publishing (no token stored).
+
 ## License
 
 MIT
