@@ -1,5 +1,13 @@
 import { TARGET_KEY_ENV, TARGET_URL_ENV } from "./config.js";
-import { ApiError, AuthError, cursorGuard, type Http, type RequestOptions } from "./http.js";
+import {
+  ApiError,
+  AuthError,
+  cursorGuard,
+  type Http,
+  nextCursor,
+  pageItems,
+  type RequestOptions,
+} from "./http.js";
 import type { Logger } from "./log.js";
 import { VERSION } from "./meta.js";
 import type {
@@ -185,15 +193,15 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
         path,
         paged ? { query: { limit: 100, after } } : {},
       );
-      guard(body.data, after);
-      rows.push(...body.data);
-      const last = body.data.at(-1);
-      if (!paged || !body.has_more || !last) {
+      const data = pageItems<Row>(path, body, after);
+      guard(data, after);
+      rows.push(...data);
+      if (!paged || body.has_more !== true || data.length === 0) {
         return rows.sort(
           (a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id),
         );
       }
-      after = last.id;
+      after = nextCursor(path, data, after);
     }
   }
 

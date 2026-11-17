@@ -4,7 +4,9 @@ import {
   AuthError,
   createHttp,
   cursorGuard,
+  nextCursor,
   PaginationError,
+  pageItems,
   retryAfterMs,
 } from "../src/http.js";
 import { createLogger } from "../src/log.js";
@@ -347,5 +349,24 @@ describe("cursorGuard", () => {
     guard(rows("a"), undefined);
     guard(rows("b"), "a");
     expect(() => guard(rows("c"), "b")).toThrow("more than 2 pages");
+  });
+});
+
+describe("pageItems and nextCursor", () => {
+  it("refuses an answer without a data array instead of reading it as an empty page", () => {
+    for (const body of [{ has_more: false }, { data: null }, { data: "x" }, null, "text"]) {
+      expect(() => pageItems("/contacts", body, "a")).toThrow(PaginationError);
+      expect(() => pageItems("/contacts", body, "a")).toThrow("the list page has no data array");
+    }
+    expect(pageItems("/contacts", { data: [{ id: "a" }] }, undefined)).toEqual([{ id: "a" }]);
+  });
+
+  it("continues only from the last item's non-empty string id", () => {
+    expect(nextCursor("/contacts", [{ id: "a" }, { id: "b" }], undefined)).toBe("b");
+    for (const last of [{}, { id: "" }, { id: 7 }, { id: null }, null]) {
+      expect(() => nextCursor("/contacts", [{ id: "a" }, last], "z")).toThrow(
+        "the last item of the list page has no id to continue from",
+      );
+    }
   });
 });

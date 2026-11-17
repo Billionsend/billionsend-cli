@@ -1,4 +1,4 @@
-import { cursorGuard, type Http, type RequestOptions } from "../http.js";
+import { cursorGuard, type Http, nextCursor, pageItems, type RequestOptions } from "../http.js";
 import type { Logger } from "../log.js";
 import type {
   DnsRecord,
@@ -323,13 +323,12 @@ export function createResendSource(http: Http, log: Logger): Source {
     const guard = cursorGuard(route);
     for (;;) {
       const { body } = await get<ListBody<T>>(route, { query: { ...query, limit: PAGE, after } });
-      const data = body.data ?? [];
+      const data = pageItems<T>(route, body, after);
       guard(data, after);
       items.push(...data);
-      const last = data[data.length - 1];
       const hasMore = body.has_more ?? data.length === PAGE;
-      if (!hasMore || last === undefined) break;
-      after = last.id;
+      if (!hasMore || data.length === 0) break;
+      after = nextCursor(route, data, after);
       if (label !== undefined) onProgress?.({ label, n: items.length, done: false });
     }
     if (label !== undefined) {

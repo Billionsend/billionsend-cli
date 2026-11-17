@@ -438,6 +438,21 @@ describe("createResendSource", () => {
     );
   });
 
+  it("listAll stops with a PaginationError on a page without data or a last item without an id", async () => {
+    const { src } = source();
+    fake.injectOnce("/contacts", { status: 200, body: { object: "list", has_more: false } });
+    await expect(src.readShallow({ include: new Set(["contacts"]) })).rejects.toThrow(
+      /no data array/,
+    );
+    fake.injectOnce("/contacts", {
+      status: 200,
+      body: { object: "list", data: [{ email: "grace@example.net" }], has_more: true },
+    });
+    await expect(src.readShallow({ include: new Set(["contacts"]) })).rejects.toThrow(
+      /no id to continue from/,
+    );
+  });
+
   it("readShallow lists contacts, properties and topics for an enrichment-only include", async () => {
     const { src } = source();
     const snapshot = await src.readShallow({ include: new Set(["enrichment"]) });

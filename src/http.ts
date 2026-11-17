@@ -38,6 +38,40 @@ export class PaginationError extends Error {
 export const MAX_PAGES = 100_000;
 
 /**
+ * The items of one page of a cursor walk. An answer without a `data` array is
+ * not a list page: thrown, never read as an empty page that ends the walk.
+ */
+export function pageItems<T>(path: string, body: unknown, after: string | undefined): T[] {
+  const data =
+    typeof body === "object" && body !== null ? (body as { data?: unknown }).data : undefined;
+  if (!Array.isArray(data))
+    throw new PaginationError(path, after, "the list page has no data array");
+  return data as T[];
+}
+
+/**
+ * The cursor to continue after: the id of the page's last item, a non-empty
+ * string. Without one the walk cannot go on, and would otherwise ask for the
+ * first page again.
+ */
+export function nextCursor(
+  path: string,
+  page: readonly unknown[],
+  after: string | undefined,
+): string {
+  const last = page.at(-1);
+  const id = typeof last === "object" && last !== null ? (last as { id?: unknown }).id : undefined;
+  if (typeof id !== "string" || id === "") {
+    throw new PaginationError(
+      path,
+      after,
+      "the last item of the list page has no id to continue from",
+    );
+  }
+  return id;
+}
+
+/**
  * One check per page of a cursor walk. A server that ignores `after` hands the
  * first page back forever; every page must move the cursor and bring new ids.
  */
@@ -52,7 +86,7 @@ export function cursorGuard(
     if (pages > maxPages) {
       throw new PaginationError(path, after, `more than ${maxPages} pages walked`);
     }
-    if (page.length > 0 && page[page.length - 1]?.id === after) {
+    if (after !== undefined && page.length > 0 && page[page.length - 1]?.id === after) {
       throw new PaginationError(
         path,
         after,
