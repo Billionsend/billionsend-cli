@@ -153,3 +153,19 @@ describe("column", () => {
     ).toEqual(["Topics           5/5", "Contacts 1,250/1,250"]);
   });
 });
+
+describe("wrapIndent keep", () => {
+  it("never breaks a kept token at its own spaces, and still wraps around it", () => {
+    const token = "mary jane@example.com";
+    const text = `✗ contacts/${token} — Invalid email address: contains a space`;
+    const wrapped = wrapIndent(text, { width: 30, indent: "  ", hanging: "    ", keep: [token] });
+    expect(wrapped.split("\n").some((line) => line.includes(token))).toBe(true);
+    expect(wrapped.split("\n").length).toBeGreaterThan(1);
+    // Without keep the address is cut at its space.
+    expect(
+      wrapIndent(text, { width: 30, indent: "  ", hanging: "    " })
+        .split("\n")
+        .some((line) => line.includes(token)),
+    ).toBe(false);
+  });
+});

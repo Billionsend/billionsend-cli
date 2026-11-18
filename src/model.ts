@@ -151,27 +151,22 @@ export interface Snapshot {
   metrics: SourceMetrics;
   /** True once contacts carry properties and topic subscriptions. */
   enriched: boolean;
+  /** Set by --segment: segments and contacts are only those of these source segments. */
+  segmentScope: { id: string; name: string }[] | null;
 }
 
 export interface TargetUsage {
+  /** The team's plan; null for the instance's own team, which no plan limits. */
   plan: string | null;
-  /** A daily plan sets emailsPerDay, a monthly one emailsPerMonth; null = unlimited. */
+  /** What the plan allows; null = no cap. A daily plan sets emailsPerDay, a monthly one emailsPerMonth. */
   limits: {
     emailsPerDay: number | null;
     emailsPerMonth: number | null;
     domains: number | null;
     contacts: number | null;
   };
-  today: { emailsSent: number };
-  /** The billing period on a monthly plan; null on daily plans. */
-  period: {
-    emailsSent: number;
-    included: number;
-    overageEnabled: boolean;
-    startsAt: string;
-    endsAt: string;
-  } | null;
-  appUrl: string | null;
+  /** Whether sends past the monthly quota bill as overage instead of being refused. */
+  overageEnabled: boolean;
 }
 
 export interface TargetDomain {
@@ -213,9 +208,12 @@ export interface TargetTemplate {
   name: string;
   alias: string | null;
   /** Bodies come from GET /templates/{id}; the plan diffs them against the source. */
+  from?: string | null | undefined;
+  replyTo?: string[] | null | undefined;
   subject?: string | null | undefined;
   html?: string | undefined;
   text?: string | null | undefined;
+  variables?: { key: string; type: string; fallback_value: string | number | null }[] | undefined;
 }
 
 export interface TargetBroadcast {
@@ -252,11 +250,24 @@ export interface PlanItem {
   count?: number | undefined;
 }
 
+/** The options that decide a plan's content, as the plan file records them; `apply` follows them. */
+export interface PlanOptionsRecord {
+  only: Resource[] | null;
+  skip: Resource[];
+  segment: string[];
+  onConflict: "upsert" | "skip" | "error";
+  includeSent: boolean;
+  freshWebhookSecrets: boolean;
+}
+
 export interface Plan {
-  version: 1;
+  version: 2;
   createdAt: string;
   source: ProviderId;
   target: { baseUrl: string; plan: string | null };
+  options: PlanOptionsRecord;
+  /** The source segments --segment limited the plan to; null for the whole account. */
+  scope: { segments: { id: string; name: string }[] } | null;
   rps: number;
   items: PlanItem[];
   counts: Record<PlanAction, number>;
@@ -281,6 +292,12 @@ export interface MigrateState {
     topicsDone?: string[] | undefined;
     /** Set once both enrichment passes have reached the end of the source; later runs are syncs. */
     enrichmentCompleted?: boolean | undefined;
+    /**
+     * Lowercased addresses of contacts this tool created (or failed to enrich)
+     * that no enrichment run has finished yet: they still get their full topic
+     * list in a later run, whatever the contacts pass reports for them then.
+     */
+    pendingEnrichment?: string[] | undefined;
     suppressionsDone?: boolean | undefined;
   };
   /** Older state files, and instances without per-row status codes, leave `statusCode` out. */

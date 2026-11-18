@@ -3,6 +3,7 @@ import type {
   Plan,
   PlanAction,
   PlanItem,
+  PlanOptionsRecord,
   Resource,
   Snapshot,
   TargetState,
@@ -33,7 +34,7 @@ import {
   stripControl,
 } from "./utils.js";
 
-export const PLAN_VERSION = 1;
+export const PLAN_VERSION = 2;
 const BATCH_SIZE = 1000;
 
 /** Item order: each resource only references ones created before it. */
@@ -85,10 +86,9 @@ export interface BroadcastPayload {
   topicName: string | null;
 }
 
-export interface PlanOptions {
+export interface PlanOptions extends PlanOptionsRecord {
+  /** The resources the plan covers: `only` minus `skip`, or what the picker left selected. */
   include: Set<Resource>;
-  includeSent: boolean;
-  freshWebhookSecrets: boolean;
   rps: number;
   /** Requests already spent reading the source; counted into the estimate. */
   sourceRequestsSpent: number;
@@ -125,8 +125,20 @@ export function buildPlan({
   const has = (resource: Resource): boolean => options.include.has(resource);
 
   if (has("properties")) {
+    // BillionSend property keys ignore case ((team, lower(key)) is unique); Resend's do not.
+    const kept = new Map<string, string>();
     for (const p of snapshot.properties) {
-      const existing = target.properties.find((t) => t.key === p.key);
+      const lower = p.key.toLowerCase();
+      const first = kept.get(lower);
+      if (first !== undefined) {
+        add("properties", "manual", p.key, {
+          detail: `differs from \`${first}\` only in case; BillionSend property keys ignore case, so only \`${first}\` is created and no value of \`${p.key}\` is written (the contacts that have one are counted after the enrichment pass)`,
+          payload: { collidesWith: first },
+        });
+        continue;
+      }
+      kept.set(lower, p.key);
+      const existing = target.properties.find((t) => t.key.toLowerCase() === lower);
       if (!existing) {
         const payload: PropertyPayload = {
           key: p.key,
@@ -140,6 +152,13 @@ export function buildPlan({
           p.key,
           `type differs: ${p.type} on Resend, ${existing.type} here — a property's type cannot change`,
         );
+      } else if (existing.key !== p.key) {
+        // The same property here; values are written under the spelling it already has.
+        add("properties", "unchanged", p.key, {
+          targetId: existing.id,
+          detail: `already here as \`${existing.key}\` (keys ignore case)`,
+          payload: { targetKey: existing.key },
+        });
       } else {
         add("properties", "unchanged", p.key, { targetId: existing.id });
       }
@@ -293,12 +312,25 @@ export function buildPlan({
         });
       } else {
         // Only the fields that differ go in the PATCH: a body write also resets the target's visual-editor document.
+        // from, reply_to and variables are compared only when the source has them: a template
+        // with none leaves what the target holds alone.
         const desired: Record<string, unknown> = {
           name: input.name,
           alias: t.alias,
           subject: input.subject ?? null,
           html: input.html,
           text: input.text ?? null,
+          ...(input.from === undefined ? {} : { from: input.from }),
+          ...(input.reply_to === undefined ? {} : { reply_to: input.reply_to }),
+          ...(input.variables === undefined
+            ? {}
+            : {
+                variables: input.variables.map((v) => ({
+                  key: v.key,
+                  type: v.type,
+                  fallback_value: v.fallback_value ?? null,
+                })),
+              }),
         };
         const current: Record<string, unknown> = {
           name: existing.name,
@@ -306,6 +338,13 @@ export function buildPlan({
           subject: existing.subject ?? null,
           html: existing.html ?? null,
           text: existing.text ?? null,
+          from: existing.from ?? null,
+          reply_to: existing.replyTo ?? null,
+          variables: (existing.variables ?? []).map((v) => ({
+            key: v.key,
+            type: v.type,
+            fallback_value: v.fallback_value,
+          })),
         };
         const changed = changedFields(
           Object.keys(desired).map((field) => [field, desired[field], current[field]]),
@@ -374,6 +413,14 @@ export function buildPlan({
 
   if (has("broadcasts")) {
     for (const b of snapshot.broadcasts) {
+      if (
+        snapshot.segmentScope !== null &&
+        b.segmentId !== null &&
+        !snapshot.segmentScope.some((s) => s.id === b.segmentId)
+      ) {
+        add("broadcasts", "skip", b.name, { detail: "sent to a segment outside --segment" });
+        continue;
+      }
       if (b.status === "sent" && !options.includeSent) {
         add("broadcasts", "skip", b.name, {
           detail: "already sent; --include-sent imports sent broadcasts as drafts",
@@ -438,19 +485,30 @@ export function buildPlan({
     batches(contactCount) +
     batches(suppressionCount) +
     (enrichment ? facets.length * batches(enrichCount) : 0);
-  // Source reads still ahead run at `rps`; target writes at its own 10/s. Spent reads are behind us.
-  const reads = enrichment ? estimateSourceRequests(snapshot).enrichment : 0;
-  const requests = options.sourceRequestsSpent + reads + writes;
+  // The whole run, as `apply` does it (it reads the source again): every source request, spent or
+  // still to come, goes at `rps`; target writes go at their own 10/s. Count and time cover the same requests.
+  const reads =
+    options.sourceRequestsSpent + (enrichment ? estimateSourceRequests(snapshot).enrichment : 0);
+  const requests = reads + writes;
   const seconds = Math.ceil(reads / options.rps + writes / 10);
 
   return {
-    version: 1,
+    version: 2,
     createdAt: (options.now ?? new Date()).toISOString(),
     source: snapshot.provider,
     target: {
       baseUrl: options.baseUrl,
       plan: target.usage.plan,
     },
+    options: {
+      only: options.only,
+      skip: options.skip,
+      segment: options.segment,
+      onConflict: options.onConflict,
+      includeSent: options.includeSent,
+      freshWebhookSecrets: options.freshWebhookSecrets,
+    },
+    scope: snapshot.segmentScope === null ? null : { segments: snapshot.segmentScope },
     rps: options.rps,
     items,
     estimate: { requests, seconds },
@@ -608,6 +666,12 @@ function renderRow(row: PlanRow): string[] {
 export const foldedKeysLine = (keys: readonly string[]): string =>
   `${keys.slice(0, 2).map(stripControl).join(", ")} … and ${formatNumber(keys.length - 2)} more`;
 
+/** What --segment limited the plan to, in one sentence. */
+export const scopeLine = (scope: NonNullable<Plan["scope"]>): string =>
+  `Scope (--segment): only ${scope.segments.map((s) => s.name).join(", ")} and ${
+    scope.segments.length === 1 ? "its" : "their"
+  } members; contacts and the enrichment pass cover those contacts alone.`;
+
 /** Legend, items grouped by resource, totals, warnings, estimate. */
 export function renderPlan(plan: Plan): string {
   const c = plan.counts;
@@ -615,6 +679,7 @@ export function renderPlan(plan: Plan): string {
   const lines = [
     dim(ACTIONS.map((a) => `${ACTION_STYLE[a][0]} ${a}`).join("   ")),
     "",
+    ...(plan.scope === null ? [] : [wrapIndent(dim(scopeLine(plan.scope)), { hanging: "  " }), ""]),
     ...groupPlanItems(plan.items).flatMap((g) => [g.label, ...g.rows.flatMap(renderRow)]),
     "",
     wrapIndent(
@@ -655,5 +720,35 @@ export function parsePlan(text: string): Plan {
       `plan file version ${String(plan.version)} is not supported (expected ${PLAN_VERSION})`,
     );
   }
+  if (plan.options === null || typeof plan.options !== "object") {
+    throw new Error("plan file is not a migration plan");
+  }
   return plan as Plan;
+}
+
+/** How the items of two plans differ, one line per `resource/key`, in the first plan's order then the second's. */
+export function describePlanDiff(saved: Plan, current: Plan): string[] {
+  const label = (i: PlanItem): string => `${i.resource}/${i.key}`;
+  const byLabel = (plan: Plan): Map<string, PlanItem> =>
+    new Map(plan.items.map((i) => [label(i), i]));
+  const before = byLabel(saved);
+  const after = byLabel(current);
+  const lines: string[] = [];
+  for (const [name, a] of before) {
+    const b = after.get(name);
+    if (b === undefined) lines.push(`${name}: in the file, not in the current plan`);
+    else if (canonicalJson(a) !== canonicalJson(b)) {
+      const count =
+        a.count !== b.count
+          ? `, ${formatNumber(a.count ?? 0)} → ${formatNumber(b.count ?? 0)}`
+          : "";
+      lines.push(
+        `${name}: ${a.action} → ${b.action}${a.action === b.action && count === "" ? " (details differ)" : count}`,
+      );
+    }
+  }
+  for (const name of after.keys()) {
+    if (!before.has(name)) lines.push(`${name}: not in the file, in the current plan`);
+  }
+  return lines;
 }

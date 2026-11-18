@@ -10,8 +10,8 @@ import type { SourceBroadcast, SourceDomain, SourceTemplate } from "./model.js";
  * The Resend webhook event names among the events BillionSend's
  * CreateWebhookRequest accepts (openapi/api.openapi.json), in its order: a
  * subscription to these carries over as-is; test/contract.test.ts keeps the
- * two in step. Resend's other names (domain.*, topic.*, contact.topics.updated, …)
- * have no counterpart here and are dropped per webhook, listed in the plan.
+ * two in step. A name of the source that is not here has no counterpart and is
+ * dropped per webhook, listed in the plan.
  */
 export const TARGET_WEBHOOK_EVENTS = [
   "email.scheduled",
@@ -28,13 +28,22 @@ export const TARGET_WEBHOOK_EVENTS = [
   "contact.created",
   "contact.updated",
   "contact.deleted",
+  "contact.topics.updated",
   "suppression.added",
   "suppression.removed",
+  "domain.created",
+  "domain.updated",
+  "domain.deleted",
+  "topic.created",
+  "topic.updated",
+  "topic.deleted",
   "inbox.created",
   "inbox.updated",
   "inbox.deleted",
   "inbox.thread.created",
   "inbox.thread.folder.updated",
+  "inbox.thread.assigned",
+  "inbox.thread.unassigned",
   "inbox.thread.labels.updated",
   "inbox.email.received",
   "inbox.email.sent",
@@ -272,13 +281,31 @@ export function domainCreateInput(domain: SourceDomain): {
   return { input, tracking };
 }
 
+/** A declared template variable as the API takes it (`TemplateVariableInput`). */
+export interface TemplateVariableInput {
+  key: string;
+  type: "string" | "number";
+  fallback_value?: string | number | null;
+}
+
 export interface TemplateCreateInput {
   name: string;
   alias?: string;
+  /** Default sender; the target stores it on the template. */
+  from?: string;
+  /** Default Reply-To list (1–50 addresses). */
+  reply_to?: string[];
   subject?: string;
   html: string;
   text?: string;
+  /** Up to 50 variables. */
+  variables?: TemplateVariableInput[];
 }
+
+/** The API's limits on a template's declared variables and Reply-To list. */
+const TEMPLATE_VARIABLES_MAX = 50;
+const TEMPLATE_VARIABLE_KEY_RE = /^[A-Za-z0-9_]{1,50}$/;
+const TEMPLATE_REPLY_TO_MAX = 50;
 
 const listTokens = (tokens: string[]): string => tokens.join(", ");
 
@@ -288,13 +315,39 @@ export function templateCreateInput(t: SourceTemplate): {
   reason: string | null;
 } {
   const notes: string[] = [];
-  if (t.from) notes.push(`from ${t.from} is not stored on templates; pass it when sending`);
-  if (t.replyTo?.length)
-    notes.push(`reply_to ${t.replyTo.join(", ")} is not stored on templates; pass it when sending`);
-  if (t.variables.length > 0)
+  const replyTo = t.replyTo ?? [];
+  if (replyTo.length > TEMPLATE_REPLY_TO_MAX) {
     notes.push(
-      `variables ${t.variables.map((v) => v.key).join(", ")} are not stored; merge fields resolve from contact properties`,
+      `reply_to has ${replyTo.length} addresses; a template stores ${TEMPLATE_REPLY_TO_MAX}, the first ${TEMPLATE_REPLY_TO_MAX} were kept`,
     );
+  }
+  const keyOk = (key: string): boolean => TEMPLATE_VARIABLE_KEY_RE.test(key);
+  const typeOk = (type: string): boolean => type === "string" || type === "number";
+  const badKey = t.variables.filter((v) => !keyOk(v.key));
+  const badType = t.variables.filter((v) => keyOk(v.key) && !typeOk(v.type));
+  const usable = t.variables.filter((v) => keyOk(v.key) && typeOk(v.type));
+  if (badKey.length > 0) {
+    notes.push(
+      `variables ${badKey.map((v) => v.key).join(", ")} not stored: a key is 1–50 letters, digits or underscores`,
+    );
+  }
+  if (badType.length > 0) {
+    notes.push(
+      `variables ${badType.map((v) => `${v.key} (${v.type})`).join(", ")} not stored: BillionSend variables are strings or numbers`,
+    );
+  }
+  const variables = usable.slice(0, TEMPLATE_VARIABLES_MAX).map(
+    (v): TemplateVariableInput => ({
+      key: v.key,
+      type: v.type === "number" ? "number" : "string",
+      ...(v.fallbackValue === undefined ? {} : { fallback_value: v.fallbackValue }),
+    }),
+  );
+  if (usable.length > TEMPLATE_VARIABLES_MAX) {
+    notes.push(
+      `${usable.length} variables; a template stores ${TEMPLATE_VARIABLES_MAX}, the first ${TEMPLATE_VARIABLES_MAX} were kept`,
+    );
+  }
   if (!t.html) return { input: null, notes, reason: "template has no html body" };
   const html = translateMergeTags(t.html);
   const subject = t.subject ? translateMergeTags(t.subject) : null;
@@ -310,9 +363,12 @@ export function templateCreateInput(t: SourceTemplate): {
   const input: TemplateCreateInput = {
     name: t.name,
     ...(t.alias ? { alias: t.alias } : {}),
+    ...(t.from ? { from: t.from } : {}),
+    ...(replyTo.length > 0 ? { reply_to: replyTo.slice(0, TEMPLATE_REPLY_TO_MAX) } : {}),
     ...(subject ? { subject: subject.html } : {}),
     html: html.html,
     ...(text ? { text: text.html } : {}),
+    ...(variables.length > 0 ? { variables } : {}),
   };
   return { input, notes, reason: null };
 }

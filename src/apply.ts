@@ -32,6 +32,12 @@ import { chunk, formatNumber, pluralize } from "./utils.js";
 export interface ResourceCounts {
   created: number;
   updated: number;
+  /**
+   * Contacts the batch endpoint matched to an existing contact: it answers
+   * created, updated or skipped and never says whether anything changed, so
+   * those are counted as matched, not as updated or unchanged.
+   */
+  matched: number;
   unchanged: number;
   skipped: number;
   manual: number;
@@ -49,7 +55,19 @@ export interface ApplyOutcome {
   /** Source id → target id for the resources code refers to by id. */
   ids: IdMapping[];
   /** Contacts that received at least one property / one topic subscription this run. */
-  enrichment: { withProperties: number; withTopics: number };
+  enrichment: {
+    withProperties: number;
+    withTopics: number;
+    /** Property keys left out because they differ from another key only in case, with the contacts that had a value for each. */
+    droppedProperties: DroppedProperty[];
+  };
+}
+
+export interface DroppedProperty {
+  key: string;
+  /** The key kept: BillionSend property keys ignore case. */
+  collidesWith: string;
+  contacts: number;
 }
 
 export interface IdMapping {
@@ -113,6 +131,7 @@ export const ENRICHMENT_LABEL: Record<EnrichFacet, string> = {
 const emptyCounts = (): ResourceCounts => ({
   created: 0,
   updated: 0,
+  matched: 0,
   unchanged: 0,
   skipped: 0,
   manual: 0,
@@ -125,28 +144,51 @@ const finish = (step: StepHandle, failed: number, total: number): void => {
 };
 
 /**
- * The enrichment upsert for one contact. `created` is a contact's first
- * enrichment and carries the full topic list; `updated` is a later sync and
- * only carries opt-outs, so an opt-out made on the target after the first pass
- * is never flipped back to opt_in.
+ * How a contact's topics are written. `created` is a first enrichment and
+ * carries the full topic list; `updated` is a later sync and only carries
+ * opt-outs, so an opt-out made on the target after the first pass is never
+ * flipped back to opt_in; `pending` is a contact this tool created that no
+ * enrichment run has finished for yet (a contacts-only run came first, or its
+ * enrichment failed): opt-outs, plus the opt-ins that matter, those on topics
+ * that default to opt_out. An opt-in on a topic that defaults to opt_in changes
+ * nothing for a new contact, and could undo an opt-out made since.
  */
+export type EnrichmentMode = "created" | "pending" | "updated";
+
+/** The enrichment upsert for one contact; see EnrichmentMode for what each mode carries. */
 export function enrichmentItem(
   c: SourceContact,
-  pass1Status: "created" | "updated",
-  maps: { propertyKeys: ReadonlySet<string>; topicBySource: ReadonlyMap<string, string> },
+  mode: EnrichmentMode,
+  maps: {
+    /** Source property key → the key to write it under on the target. */
+    propertyKeys: ReadonlyMap<string, string>;
+    topicBySource: ReadonlyMap<string, string>;
+    /** Source ids of the topics that default to opt_out: an explicit opt_in changes something there. */
+    optOutByDefault?: ReadonlySet<string> | undefined;
+  },
   facets: readonly EnrichFacet[] = ["properties", "topics"],
 ): ContactBatchItem {
   const properties = facets.includes("properties")
     ? Object.fromEntries(
-        Object.entries(c.properties ?? {}).filter(([key]) => maps.propertyKeys.has(key)),
+        Object.entries(c.properties ?? {}).flatMap(([key, value]) => {
+          const targetKey = maps.propertyKeys.get(key);
+          return targetKey === undefined ? [] : [[targetKey, value]];
+        }),
       )
     : {};
   const topics = facets.includes("topics")
     ? (c.topics ?? []).flatMap((t) => {
         const id = maps.topicBySource.get(t.id);
-        if (id === undefined || (pass1Status === "updated" && t.subscription !== "opt_out"))
-          return [];
-        return [{ id, subscription: t.subscription }];
+        if (id === undefined) return [];
+        if (t.subscription === "opt_out" || mode === "created") {
+          return [{ id, subscription: t.subscription }];
+        }
+        // A later sync sends opt-outs only, so one made on the target is never flipped back. A
+        // contact still waiting for its first enrichment also gets the opt-ins that matter: on a
+        // topic that defaults to opt_out, dropping one leaves the contact unsubscribed.
+        return mode === "pending" && maps.optOutByDefault?.has(t.id) === true
+          ? [{ id, subscription: t.subscription }]
+          : [];
       })
     : [];
   return {
@@ -174,12 +216,16 @@ export async function applyPlan(input: ApplyInput): Promise<ApplyOutcome> {
     key: string,
     { message, statusCode }: { message: string; statusCode?: number | undefined },
   ): void => {
+    // Listed once, in the summary and the report; no per-item line on stderr as well.
     state.failures.push({ resource, key, message, statusCode });
     tally(resource).failed += 1;
-    log.warn(`${resource}/${key}: ${message}`);
   };
+  // Addresses of contacts this tool created that no enrichment run has finished for (see MigrateState).
+  const pending = new Set(state.progress.pendingEnrichment ?? []);
   const save = (): void => {
     state.updatedAt = new Date().toISOString();
+    if (pending.size > 0) state.progress.pendingEnrichment = [...pending];
+    else delete state.progress.pendingEnrichment;
     input.save(state);
   };
   const outcome: ApplyOutcome = {
@@ -188,7 +234,7 @@ export async function applyPlan(input: ApplyInput): Promise<ApplyOutcome> {
     freshSecrets: [],
     domainRecords: {},
     ids: [],
-    enrichment: { withProperties: 0, withTopics: 0 },
+    enrichment: { withProperties: 0, withTopics: 0, droppedProperties: [] },
   };
 
   // Target ids by name (broadcast references) and by source id (contact associations).
@@ -196,7 +242,9 @@ export async function applyPlan(input: ApplyInput): Promise<ApplyOutcome> {
   const topicBySource = new Map<string, string>();
   const segmentByName = new Map<string, string>();
   const segmentBySource = new Map<string, string>();
-  const propertyKeys = new Set<string>();
+  const propertyKeys = new Map<string, string>();
+  /** Source property keys that were not created because another key differs from them only in case. */
+  const collidingKeys = new Map<string, string>();
   const registerTopic = (name: string, id: string): void => {
     topicByName.set(name, id);
     const sourceTopic = snapshot.topics.find((t) => t.name === name);
@@ -211,10 +259,18 @@ export async function applyPlan(input: ApplyInput): Promise<ApplyOutcome> {
     if (item.action === "unchanged") tally(item.resource).unchanged += 1;
     else if (item.action === "manual") tally(item.resource).manual += 1;
     else if (item.action === "skip") tally(item.resource).skipped += 1;
+    if (item.resource === "properties" && item.action === "manual") {
+      const collidesWith = (item.payload as { collidesWith?: string } | undefined)?.collidesWith;
+      if (collidesWith !== undefined) collidingKeys.set(item.key, collidesWith);
+    }
     if (item.targetId === undefined) continue;
     if (item.resource === "topics") registerTopic(item.key, item.targetId);
     else if (item.resource === "segments") registerSegment(item.key, item.targetId);
-    else if (item.resource === "properties") propertyKeys.add(item.key);
+    else if (item.resource === "properties") {
+      // An existing key that differs only in case is the same property: write under its spelling.
+      const targetKey = (item.payload as { targetKey?: string } | undefined)?.targetKey;
+      propertyKeys.set(item.key, targetKey ?? item.key);
+    }
   }
 
   async function runRows(
@@ -250,7 +306,7 @@ export async function applyPlan(input: ApplyInput): Promise<ApplyOutcome> {
       type: p.type,
       fallbackValue: p.fallback_value,
     });
-    if (result.ok) propertyKeys.add(p.key);
+    if (result.ok) propertyKeys.set(p.key, p.key);
     return result;
   });
 
@@ -368,8 +424,11 @@ export async function applyPlan(input: ApplyInput): Promise<ApplyOutcome> {
         const contact = slice[row.index];
         if (contact === undefined) continue;
         pass1.set(contact.email.toLowerCase(), row.status);
-        if (row.status === "created") created("contacts", row.id);
-        else tally("contacts")[row.status] += 1;
+        if (row.status === "created") {
+          created("contacts", row.id);
+          pending.add(contact.email.toLowerCase());
+        } else if (row.status === "updated") tally("contacts").matched += 1;
+        else tally("contacts").skipped += 1;
       }
       for (const error of out.errors) {
         const contact = slice[error.index];
@@ -442,6 +501,10 @@ export async function applyPlan(input: ApplyInput): Promise<ApplyOutcome> {
     const enrichedIds = new Set<string>();
     const failedIds = new Set<string>();
     const total = snapshot.contacts.length;
+    const droppedContacts = new Map<string, number>();
+    const optOutByDefault = new Set(
+      snapshot.topics.filter((t) => t.defaultSubscription === "opt_out").map((t) => t.id),
+    );
     // Opt-outs first: a broadcast sent between the passes must reach nobody who left.
     const passes: {
       facet: EnrichFacet;
@@ -535,10 +598,21 @@ export async function applyPlan(input: ApplyInput): Promise<ApplyOutcome> {
           const status = pass1.get(contact.email.toLowerCase());
           if (status === "failed" || status === "skipped") return;
           processed += 1;
+          if (pass.facet === "properties") {
+            for (const [key, value] of Object.entries(contact.properties ?? {})) {
+              if (collidingKeys.has(key) && String(value) !== "") {
+                droppedContacts.set(key, (droppedContacts.get(key) ?? 0) + 1);
+              }
+            }
+          }
           const item = enrichmentItem(
             contact,
-            status === "created" || !synced ? "created" : "updated",
-            { propertyKeys, topicBySource },
+            status === "created" || !synced
+              ? "created"
+              : pending.has(contact.email.toLowerCase())
+                ? "pending"
+                : "updated",
+            { propertyKeys, topicBySource, optOutByDefault },
             [pass.facet],
           );
           // Without a contacts pass this run, the upsert may create the contact:
@@ -567,6 +641,24 @@ export async function applyPlan(input: ApplyInput): Promise<ApplyOutcome> {
         step.fail(`${formatNumber(failedInPass)} of ${formatNumber(total)} failed`);
       } else {
         step.done(`${formatNumber(total)} · ${formatNumber(withValues)} with ${noun}`);
+      }
+    }
+    outcome.enrichment.droppedProperties = [...collidingKeys].map(([key, collidesWith]) => ({
+      key,
+      collidesWith,
+      contacts: droppedContacts.get(key) ?? 0,
+    }));
+    // A contact the topics pass reached without a failure is enriched; a failed one stays pending.
+    // Without a topics pass (excluded from this run) nothing was written, so nobody leaves the list;
+    // with no topics on the source there is nothing left to wait for.
+    if (snapshot.topics.length === 0) pending.clear();
+    else if (passes.some((p) => p.facet === "topics" && p.wanted)) {
+      for (const c of snapshot.contacts) {
+        const email = c.email.toLowerCase();
+        const status = pass1.get(email);
+        if (status === "failed" || status === "skipped") continue;
+        if (failedIds.has(c.id)) pending.add(email);
+        else pending.delete(email);
       }
     }
     state.progress.enrichmentCompleted = true;

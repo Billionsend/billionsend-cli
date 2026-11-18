@@ -1,6 +1,7 @@
 import { writeFileSync } from "node:fs";
 import type { Context } from "../context.js";
 import { serializePlan } from "../plan.js";
+import { writePlanReport } from "../report.js";
 import { hasChanges, prepare } from "./migrate.js";
 
 /** Read-only plan; exit 0 nothing to do, 2 changes, 1 error. */
@@ -10,6 +11,10 @@ export async function plan(ctx: Context): Promise<number> {
   if (ctx.config.out !== null) {
     writeFileSync(ctx.config.out, json);
     ctx.out.write(`Plan written to ${ctx.config.out}\n`);
+  }
+  if (ctx.config.report !== null) {
+    writePlanReport(ctx.config.report, prepared.plan, prepared.provider.label);
+    ctx.out.write(`Plan report written to ${ctx.config.report}\n`);
   }
   if (ctx.config.json) ctx.stdout.write(json);
   return hasChanges(prepared.plan) ? 2 : 0;

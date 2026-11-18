@@ -66,10 +66,14 @@ export const SYM = {
 /** Lines are composed at this width, never left to the terminal to break mid-word. */
 export const layoutWidth = (): number => Math.min(process.stdout.columns ?? 80, 100);
 
+/** Stands for a space inside a token wrapIndent must keep whole; not whitespace, so it never splits. */
+const KEEP = "\u241f";
+
 /**
  * Greedy word wrap: the first line starts with `indent`, the rest with
  * `hanging` (defaults to `indent`). A word longer than the width stays whole
- * on its own line; ANSI sequences do not count toward the width.
+ * on its own line; ANSI sequences do not count toward the width. A `keep`
+ * token is never broken at its own spaces either.
  */
 export function wrapIndent(
   text: string,
@@ -77,8 +81,17 @@ export function wrapIndent(
     width = layoutWidth(),
     indent = "",
     hanging = indent,
-  }: { width?: number; indent?: string; hanging?: string } = {},
+    keep = [],
+  }: { width?: number; indent?: string; hanging?: string; keep?: readonly string[] } = {},
 ): string {
+  if (keep.length > 0) {
+    // Spaces inside a kept token (an address with a space in it) must not take a line break.
+    let guarded = text;
+    for (const token of keep) {
+      if (/\s/.test(token)) guarded = guarded.split(token).join(token.replace(/\s+/g, KEEP));
+    }
+    return wrapIndent(guarded, { width, indent, hanging }).split(KEEP).join(" ");
+  }
   const lines: string[] = [];
   let line = indent;
   let empty = true;

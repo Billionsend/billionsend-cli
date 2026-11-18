@@ -26,6 +26,35 @@ describe("parseConfig", () => {
     });
   });
 
+  it("--segment repeats and splits on commas, and `given` names the plan options the command line set", () => {
+    const config = parseConfig(
+      [
+        "migrate",
+        "plan",
+        "--from",
+        "resend",
+        "--segment",
+        "A",
+        "--segment",
+        "B, C,A",
+        "--only",
+        "contacts",
+      ],
+      env,
+      true,
+    );
+    expect(config.segment).toEqual(["A", "B", "C"]);
+    expect([...config.given].sort()).toEqual(["only", "segment"]);
+    expect(parseConfig(["migrate", "--from", "resend"], env, true)).toMatchObject({
+      segment: [],
+      given: new Set(),
+    });
+    expect(() =>
+      parseConfig(["migrate", "--from", "resend", "--segment", "A,,B"], env, true),
+    ).toThrow("--segment needs a segment name or id");
+    expect(helpText()).toContain("--segment <name|id>");
+  });
+
   it("accepts --rps above Resend's default limit up to the ceiling, and remembers it was given", () => {
     const raised = parseConfig(["migrate", "--from", "resend", "--rps", "50"], env, true);
     expect(raised).toMatchObject({ rps: 50, rpsGiven: true });

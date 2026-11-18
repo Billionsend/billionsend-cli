@@ -144,7 +144,7 @@ const occurrences = (haystack: string, needle: string): number => haystack.split
 beforeAll(async () => {
   [fake, cloud] = await Promise.all([
     startFakeResend(realisticAccount()),
-    startContractApi({ appBaseUrl: "https://app.example.test", slug: "cloud" }),
+    startContractApi({ slug: "cloud" }),
   ]);
   cwd = mkdtempSync(join(tmpdir(), "billionsend-e2e-"));
   writeFileSync(join(cwd, ".gitignore"), "node_modules\n");
@@ -191,9 +191,9 @@ describe("billionsend (built bundle)", () => {
       const { code, stdout, stderr } = await run(["migrate", "plan", "--from", "resend", "--json"]);
       expect(code).toBe(2);
       const plan = JSON.parse(stdout) as Plan;
-      expect(plan.version).toBe(1);
+      expect(plan.version).toBe(2);
       expect(plan.target).toEqual({ baseUrl: cloud.baseUrl, plan: "pro" });
-      expect(plan.counts).toEqual({ create: 23, update: 2, unchanged: 1, manual: 12, skip: 3 });
+      expect(plan.counts).toEqual({ create: 23, update: 2, unchanged: 1, manual: 9, skip: 3 });
       expect(stderr).toMatch(new RegExp(`✓ Contacts\\s+${CONTACT_COUNT.toLocaleString("en-US")}`));
       expect(stderr).toMatch(/✓ BillionSend\s+current state read/);
 
@@ -250,11 +250,10 @@ describe("billionsend (built bundle)", () => {
         "broadcasts/Spring sale — merge tags left as-is: {{{contact.address.city|your city}}}",
       );
       expect(manual).toContain(
-        "templates/welcome — variables first_name, credits, flags are not stored; merge fields resolve from contact properties",
+        "templates/welcome — variables flags (object) not stored: BillionSend variables are strings or numbers",
       );
-      expect(manual).toContain(
-        "templates/Receipt — reply_to support@example.com is not stored on templates; pass it when sending",
-      );
+      // from, reply_to and the string and number variables are carried over, not listed.
+      expect(manual.filter((m) => m.startsWith("templates/Receipt"))).toEqual([]);
       expect(plan.warnings).toEqual([]);
       expect(stderr).not.toContain("domains will be created; the rest are listed as manual.");
       expect(plan.estimate.requests).toBeGreaterThan(2 * CONTACT_COUNT);
@@ -367,16 +366,20 @@ describe("billionsend (built bundle)", () => {
         `billionsend ${VERSION} — Moves your Resend account into BillionSend.`,
       );
       expect(stdout).toContain("✓ Resend · connected");
-      expect(stdout).toContain("✓ BillionSend Cloud · plan Pro");
+      expect(stdout).toContain(`✓ BillionSend (${cloud.baseUrl}) · plan Pro`);
       expect(stdout).toContain("Resend was only read; nothing there was changed.");
-      expect(stdout).toContain(`${CONTACT_COUNT.toLocaleString("en-US")}  contacts updated`);
+      expect(stdout).toContain(
+        `${CONTACT_COUNT.toLocaleString("en-US")}  contacts matched existing`,
+      );
       expect(stdout).toContain(`${enrichable().toLocaleString("en-US")}  contacts enriched`);
       expect(stdout).toContain("3  broadcasts unchanged");
       expect(stdout).toContain("40  suppressions unchanged");
       expect(stdout).toContain("steps done — left:");
       expect(stdout).toContain("[ ] add DNS records for news.example.com");
       expect(stdout).toContain("[ ] add DNS records for updates.example.com");
-      expect(stdout).toContain(`[ ] set RESEND_BASE_URL=${cloud.baseUrl} in your app`);
+      expect(stdout.replace(/\s+/g, " ")).toContain(
+        "[ ] set RESEND_BASE_URL=https://api.billionsend.com in your app, so Resend SDK calls go to BillionSend",
+      );
       expect(stdout).toContain(`[ ] create API keys: ${API_KEY_NAMES.join(", ")}`);
       expect(stdout).toContain(
         "[ ] replace Resend topic and segment ids in your code (id map below)",
@@ -423,7 +426,8 @@ describe("billionsend (built bundle)", () => {
       const report = readReport();
       expect(report.counts.contacts).toMatchObject({
         created: 0,
-        updated: CONTACT_COUNT,
+        updated: 0,
+        matched: CONTACT_COUNT,
         failed: 0,
       });
       expect(report.counts.enrichment).toMatchObject({ updated: enrichable(), failed: 0 });
@@ -631,7 +635,11 @@ describe("billionsend (built bundle)", () => {
       });
       expect(report.counts.webhooks).toMatchObject({ created: 0, unchanged: 2 });
       expect(report.counts.templates).toMatchObject({ created: 0, unchanged: 4 });
-      expect(report.counts.contacts).toMatchObject({ created: 0, updated: CONTACT_COUNT });
+      expect(report.counts.contacts).toMatchObject({
+        created: 0,
+        updated: 0,
+        matched: CONTACT_COUNT,
+      });
       // A sync re-run refreshes properties and opt-outs for every existing contact.
       expect(report.counts.enrichment).toMatchObject({ updated: enrichable(), failed: 0 });
       expect(report.counts.broadcasts).toMatchObject({ created: 0, unchanged: 3, skipped: 3 });
@@ -662,7 +670,7 @@ describe("billionsend (built bundle)", () => {
         );
         expect(stderr).toBe("");
         expect(code).toBe(0);
-        expect(stdout).toContain("✓ BillionSend Cloud · plan Pro");
+        expect(stdout).toContain(`✓ BillionSend (${self.baseUrl}) · plan Pro`);
         expect(stdout).toContain(
           "Webhook signing secrets, shown once (they are not saved anywhere):",
         );
@@ -710,10 +718,17 @@ describe("billionsend (built bundle)", () => {
         "webhooks",
         "templates",
         "broadcasts",
-        "suppressions",
       ]) {
         expect(rowCount(cloud, table as Parameters<ContractApi["count"]>[0]), table).toBe(0);
       }
+      // Bounce and complaint suppressions are permanent: the API keeps them and rollback says so.
+      const permanent = fake.data.suppressions.filter(
+        (row) => row.origin === "bounce" || row.origin === "complaint",
+      ).length;
+      expect(rowCount(cloud, "suppressions")).toBe(permanent);
+      expect(stdout).toContain(
+        `${permanent} suppressions stay: a bounce or complaint entry is permanent`,
+      );
       const topics = await list<{ name: string; description?: string }>(cloud, "/topics");
       expect(topics.map((t) => [t.name, t.description])).toEqual([
         ["Newsletter", "Monthly digest"],

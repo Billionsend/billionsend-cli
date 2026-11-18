@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { RESOURCES, type Resource, type Snapshot, type TargetState } from "../src/model.js";
 import {
   buildPlan,
+  describePlanDiff,
   groupPlanItems,
   type PlanOptions,
   parsePlan,
@@ -22,9 +23,7 @@ const emptyTarget: TargetState = {
   usage: {
     plan: null,
     limits: { emailsPerDay: null, emailsPerMonth: null, domains: null, contacts: null },
-    today: { emailsSent: 0 },
-    period: null,
-    appUrl: null,
+    overageEnabled: false,
   },
   domains: [],
   properties: [],
@@ -40,9 +39,7 @@ const goldenTarget: TargetState = {
   usage: {
     plan: "free",
     limits: { emailsPerDay: 100, emailsPerMonth: null, domains: 1, contacts: 1000 },
-    today: { emailsSent: 0 },
-    period: null,
-    appUrl: "https://billionsend.com",
+    overageEnabled: false,
   },
   domains: [
     { id: "d1", name: "example.com", region: "us-east-1", status: "verified", records: [] },
@@ -80,6 +77,10 @@ const goldenTarget: TargetState = {
 
 const options = (overrides: Partial<PlanOptions> = {}): PlanOptions => ({
   include: new Set<Resource>(RESOURCES),
+  only: null,
+  skip: [],
+  segment: [],
+  onConflict: "upsert",
   includeSent: false,
   freshWebhookSecrets: false,
   rps: 8,
@@ -113,19 +114,11 @@ domains
 webhooks
   ~ https://webhook.example.com/handler  events
   ! https://webhook.example.com/handler  events not delivered here:
-    domain.created
+    template.created
   + https://hooks.example.com/contacts  2 events, fresh secret
 templates
-  ~ welcome  name
-  ! welcome  from Acme <onboarding@example.com> is not stored on templates; pass
-    it when sending
-  ! welcome  reply_to support@example.com is not stored on templates; pass it
-    when sending
-  ! welcome  variables first_name are not stored; merge fields resolve from
-    contact properties
+  ~ welcome  name, from, reply_to, variables
   + Receipt
-  ! Receipt  variables order_id are not stored; merge fields resolve from
-    contact properties
 contacts (5)
   + contacts  batch upsert, 3 segment memberships
 broadcasts
@@ -141,9 +134,9 @@ api-keys
   ! Production  create by hand; Resend exposes only the name
   ! Staging  create by hand; Resend exposes only the name
 
-Plan: 11 to create, 5 to update, 2 unchanged, 11 manual, 1 skipped.
+Plan: 11 to create, 5 to update, 2 unchanged, 7 manual, 1 skipped.
 warning: 2 domains to create; the Free plan allows 1 (1 already there)
-Estimate: ~67 requests · 3 s at 8 req/s
+Estimate: ~67 requests · 8 s at 8 req/s
 `;
 
 const stdout = process.stdout as unknown as { columns?: number | undefined };
@@ -166,24 +159,27 @@ describe("buildPlan + renderPlan (golden)", () => {
   });
 
   it("counts, header and manual list agree with the items", () => {
-    expect(plan.counts).toEqual({ create: 11, update: 5, unchanged: 2, manual: 11, skip: 1 });
+    expect(plan.counts).toEqual({ create: 11, update: 5, unchanged: 2, manual: 7, skip: 1 });
     expect(plan).toMatchObject({
-      version: 1,
+      version: 2,
       createdAt: "2026-09-01T12:00:00.000Z",
       source: "resend",
       target: { baseUrl: "https://api.billionsend.com", plan: "free" },
       rps: 8,
     });
-    expect(plan.manual).toHaveLength(11);
+    expect(plan.manual).toHaveLength(7);
     expect(plan.manual[0]).toEqual({
       title: "segments/Enterprise",
       detail: 'filter not translated (unsupported field "plan_tier"); 1 member still imported',
     });
   });
 
-  it("estimates: spent + one read per contact per facet + writes; seconds count only what is ahead", () => {
+  it("estimates: spent + one read per contact per facet + writes; seconds cover the same requests", () => {
     // writes: 9 creates + 4 updates + contacts batch + suppressions batch + one enrichment batch per facet = 17
-    expect(plan.estimate).toEqual({ requests: 40 + 10 + 17, seconds: Math.ceil(10 / 8 + 17 / 10) });
+    expect(plan.estimate).toEqual({
+      requests: 40 + 10 + 17,
+      seconds: Math.ceil((40 + 10) / 8 + 17 / 10),
+    });
     const topicsOnly = buildPlan({
       snapshot: { ...snapshot, properties: [] },
       target: goldenTarget,
@@ -192,7 +188,7 @@ describe("buildPlan + renderPlan (golden)", () => {
     // One facet: 5 reads, one write fewer (the seats property is not created).
     expect(topicsOnly.estimate).toEqual({
       requests: 40 + 5 + 15,
-      seconds: Math.ceil(5 / 8 + 15 / 10),
+      seconds: Math.ceil((40 + 5) / 8 + 15 / 10),
     });
   });
 
@@ -226,12 +222,18 @@ describe("buildPlan + renderPlan (golden)", () => {
     expect(byKey("webhooks", "https://webhook.example.com/handler", "update")?.payload).toEqual({
       events: ["email.sent", "email.delivered", "email.bounced"],
     });
-    expect(byKey("templates", "welcome", "update")?.payload).toEqual({ name: "Welcome" });
+    expect(byKey("templates", "welcome", "update")?.payload).toEqual({
+      name: "Welcome",
+      from: "Acme <onboarding@example.com>",
+      reply_to: ["support@example.com"],
+      variables: [{ key: "first_name", type: "string", fallback_value: "friend" }],
+    });
     expect(byKey("templates", "Receipt")?.payload).toEqual({
       name: "Receipt",
       subject: "Your receipt",
       html: "<p>Order {{{order_id}}}</p>",
       text: "Order {{{order_id}}}",
+      variables: [{ key: "order_id", type: "string" }],
     });
     expect(byKey("broadcasts", "November announcements")?.payload).toEqual({
       input: {
@@ -328,8 +330,8 @@ describe("buildPlan against an empty target", () => {
       ["contacts", 5],
       ["suppressions", 3],
     ]);
-    // No enrichment reads, no per-item writes: 40 + (1 + 1) writes; the 40 are already spent.
-    expect(plan.estimate).toEqual({ requests: 42, seconds: Math.ceil(2 / 10) });
+    // No enrichment reads, no per-item writes: 40 spent source requests at 8/s + (1 + 1) writes at 10/s.
+    expect(plan.estimate).toEqual({ requests: 42, seconds: Math.ceil(40 / 8 + 2 / 10) });
     expect(plan.items[0]?.detail).toBe("batch upsert, 0 segment memberships");
   });
 
@@ -433,6 +435,7 @@ describe("buildPlan diffs against existing rows", () => {
     subject: "Your receipt",
     html: "<p>Order {{{order_id}}}</p>",
     text: "Order {{{order_id}}}",
+    variables: [{ key: "order_id", type: "string", fallback_value: null }],
   };
 
   it("matches templates by alias before name and diffs the alias", () => {
@@ -440,7 +443,15 @@ describe("buildPlan diffs against existing rows", () => {
       snapshot,
       target: withRows({
         templates: [
-          { ...goldenTarget.templates[0], id: "a", name: "Welcome", alias: null },
+          {
+            ...goldenTarget.templates[0],
+            id: "a",
+            name: "Welcome",
+            alias: null,
+            from: "Acme <onboarding@example.com>",
+            replyTo: ["support@example.com"],
+            variables: [{ key: "first_name", type: "string", fallback_value: "friend" }],
+          },
           { id: "b", name: "Receipt", alias: "receipt", ...receiptBody },
         ],
       }),
@@ -628,8 +639,9 @@ describe("planHash / serializePlan / parsePlan", () => {
     ["{", "plan file is not valid JSON"],
     ["null", "plan file is not a migration plan"],
     ['{"version":1}', "plan file is not a migration plan"],
-    ['{"version":2,"items":[]}', "plan file version 2 is not supported (expected 1)"],
-    ['{"items":[]}', "plan file version undefined is not supported (expected 1)"],
+    ['{"version":1,"items":[]}', "plan file version 1 is not supported (expected 2)"],
+    ['{"items":[]}', "plan file version undefined is not supported (expected 2)"],
+    ['{"version":2,"items":[]}', "plan file is not a migration plan"],
   ])("rejects %s", (text, message) => {
     expect(() => parsePlan(text)).toThrow(message);
   });
@@ -719,7 +731,7 @@ describe("renderPlan colours", () => {
     expect(lines).toContain(
       "Plan: \x1b[1m1\x1b[22m to create, 0 to update, 0 unchanged, 0 manual.",
     );
-    expect(lines.at(-2)).toBe("\x1b[2mEstimate: ~41 requests · 1 s at 8 req/s\x1b[22m");
+    expect(lines.at(-2)).toBe("\x1b[2mEstimate: ~41 requests · 6 s at 8 req/s\x1b[22m");
   });
 
   it("wraps on visible width, so color codes never count", () => {
@@ -733,5 +745,130 @@ describe("renderPlan colours", () => {
     // The one-line legend is the only line never wrapped.
     for (const line of text.split("\n").slice(1))
       expect(visibleLength(line)).toBeLessThanOrEqual(30);
+  });
+});
+
+describe("property keys that differ only in case", () => {
+  const only = (...r: Resource[]) => new Set<Resource>(r);
+  const props = (...keys: string[]): Snapshot["properties"] =>
+    keys.map((key) => ({ key, type: "string" as const }));
+
+  it("creates the first, lists the others as manual items that name the key kept", () => {
+    const plan = buildPlan({
+      snapshot: { ...snapshot, properties: props("plan", "PLAN", "Plan", "seats") },
+      target: emptyTarget,
+      options: options({ include: only("properties") }),
+    });
+    expect(plan.items.map((i) => [i.action, i.key])).toEqual([
+      ["create", "plan"],
+      ["manual", "PLAN"],
+      ["manual", "Plan"],
+      ["create", "seats"],
+    ]);
+    expect(plan.items[1]).toMatchObject({
+      payload: { collidesWith: "plan" },
+      detail: expect.stringContaining("differs from `plan` only in case"),
+    });
+    expect(plan.manual).toHaveLength(2);
+  });
+
+  it("matches a key on the target ignoring case, and writes under the target's spelling", () => {
+    const plan = buildPlan({
+      snapshot: { ...snapshot, properties: props("plan") },
+      target: withProperties([{ id: "p1", key: "Plan", type: "string" }]),
+      options: options({ include: only("properties") }),
+    });
+    expect(plan.items).toEqual([
+      {
+        resource: "properties",
+        action: "unchanged",
+        key: "plan",
+        targetId: "p1",
+        detail: "already here as `Plan` (keys ignore case)",
+        payload: { targetKey: "Plan" },
+      },
+    ]);
+  });
+
+  it("a type that differs from the target's key is manual, whatever the case", () => {
+    const plan = buildPlan({
+      snapshot: { ...snapshot, properties: [{ key: "seats", type: "number" }] },
+      target: withProperties([{ id: "p1", key: "SEATS", type: "string" }]),
+      options: options({ include: only("properties") }),
+    });
+    expect(plan.items.map((i) => i.action)).toEqual(["manual"]);
+  });
+
+  const withProperties = (properties: TargetState["properties"]): TargetState => ({
+    ...emptyTarget,
+    properties,
+  });
+});
+
+describe("plan options and scope", () => {
+  it("records the options and the segments the plan was limited to", () => {
+    const plan = buildPlan({
+      snapshot: { ...snapshot, segmentScope: [{ id: "s1", name: "Active Users" }] },
+      target: emptyTarget,
+      options: options({
+        only: ["contacts", "segments"],
+        segment: ["Active Users"],
+        onConflict: "skip",
+        include: new Set<Resource>(["contacts", "segments"]),
+      }),
+    });
+    expect(plan.options).toEqual({
+      only: ["contacts", "segments"],
+      skip: [],
+      segment: ["Active Users"],
+      onConflict: "skip",
+      includeSent: false,
+      freshWebhookSecrets: false,
+    });
+    expect(plan.scope).toEqual({ segments: [{ id: "s1", name: "Active Users" }] });
+    setColorMode("never");
+    expect(renderPlan(plan)).toContain("Scope (--segment): only Active Users and its members");
+    setColorMode("auto");
+    expect(buildPlan({ snapshot, target: emptyTarget, options: options() }).scope).toBeNull();
+  });
+
+  it("skips a broadcast sent to a segment outside the scope and keeps the ones without a segment", () => {
+    const base = snapshot.broadcasts[0];
+    const plan = buildPlan({
+      snapshot: {
+        ...snapshot,
+        segmentScope: [{ id: "in", name: "In" }],
+        broadcasts: [
+          { ...base, id: "b1", name: "Out", segmentId: "out", status: "draft" },
+          { ...base, id: "b2", name: "In", segmentId: "in", status: "draft" },
+          { ...base, id: "b3", name: "None", segmentId: null, status: "draft" },
+        ],
+      } as Snapshot,
+      target: emptyTarget,
+      options: options({ include: new Set<Resource>(["broadcasts"]) }),
+    });
+    expect(plan.items.find((i) => i.key === "Out")).toMatchObject({
+      action: "skip",
+      detail: "sent to a segment outside --segment",
+    });
+    expect(plan.items.filter((i) => i.action === "skip")).toHaveLength(1);
+  });
+});
+
+describe("describePlanDiff", () => {
+  it("names what was added, gone and changed", () => {
+    const a = buildPlan({ snapshot, target: emptyTarget, options: options() });
+    const b = {
+      ...a,
+      items: [
+        ...a.items.filter((i) => i.key !== "seats"),
+        { resource: "topics", action: "create", key: "Brand new" },
+      ].map((i) => (i.resource === "contacts" ? { ...i, count: 6 } : i)),
+    } as typeof a;
+    const lines = describePlanDiff(a, b);
+    expect(lines).toContain("properties/seats: in the file, not in the current plan");
+    expect(lines).toContain("topics/Brand new: not in the file, in the current plan");
+    expect(lines).toContain("contacts/contacts: create → create, 5 → 6");
+    expect(describePlanDiff(a, a)).toEqual([]);
   });
 });

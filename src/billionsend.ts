@@ -22,7 +22,7 @@ import type {
   TargetUsage,
   TargetWebhook,
 } from "./model.js";
-import { TARGET_ALL_EVENTS } from "./translate.js";
+import { TARGET_ALL_EVENTS, type TemplateVariableInput } from "./translate.js";
 import { chunk } from "./utils.js";
 
 /** POST /contacts/batch and /suppressions/batch/* accept at most this many items. */
@@ -59,6 +59,8 @@ export interface BatchOutcome {
 export interface SuppressionsOutcome {
   /** One id per distinct address the API accepted, existing rows included. */
   ids: string[];
+  /** Removals only: matched rows the API left in place. A bounce or complaint entry is permanent. */
+  notRemoved: { id: string; reason: string }[];
   errors: { index: number; statusCode: number; message: string }[];
 }
 
@@ -67,24 +69,15 @@ interface ListPage<T> {
   has_more: boolean;
 }
 
-/** Instances that predate monthly plans send neither emails_per_month nor period; those before the contact cap send no contacts limit. */
+/** The part of GET /usage (UsageResponse) the CLI reads; every `limit` is null where the plan does not cap it. */
 interface UsageWire {
   plan: string | null;
-  limits: {
-    emails_per_day: number | null;
-    emails_per_month?: number | null;
-    domains: number | null;
-    contacts?: number | null;
+  emails: {
+    daily: { limit: number | null };
+    monthly: { limit: number | null; overage_enabled: boolean };
   };
-  today: { emails_sent: number };
-  period?: {
-    emails_sent: number;
-    included: number;
-    overage_enabled: boolean;
-    starts_at: string;
-    ends_at: string;
-  } | null;
-  app_url: string | null;
+  contacts: { limit: number | null };
+  domains: { limit: number | null };
 }
 
 interface DomainWire {
@@ -113,9 +106,12 @@ interface TemplateWire {
   id: string;
   name: string;
   alias: string | null;
+  from: string | null;
+  reply_to: string[] | null;
   subject: string | null;
   html: string;
   text: string | null;
+  variables: { key: string; type: string; fallback_value: string | number | null }[];
 }
 
 type BatchWire = Omit<BatchOutcome, "errors"> & { errors?: BatchOutcome["errors"] | undefined };
@@ -223,24 +219,15 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
       }
       throw error;
     }
-    const period = body.period ?? null;
     return {
       plan: body.plan,
       limits: {
-        emailsPerDay: body.limits.emails_per_day,
-        emailsPerMonth: body.limits.emails_per_month ?? null,
-        domains: body.limits.domains,
-        contacts: body.limits.contacts ?? null,
+        emailsPerDay: body.emails.daily.limit,
+        emailsPerMonth: body.emails.monthly.limit,
+        domains: body.domains.limit,
+        contacts: body.contacts.limit,
       },
-      today: { emailsSent: body.today.emails_sent },
-      period: period && {
-        emailsSent: period.emails_sent,
-        included: period.included,
-        overageEnabled: period.overage_enabled,
-        startsAt: period.starts_at,
-        endsAt: period.ends_at,
-      },
-      appUrl: body.app_url,
+      overageEnabled: body.emails.monthly.overage_enabled,
     };
   }
 
@@ -286,9 +273,16 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
         id: body.id,
         name: body.name,
         alias: body.alias,
+        from: body.from,
+        replyTo: body.reply_to,
         subject: body.subject,
         html: body.html,
         text: body.text,
+        variables: body.variables.map(({ key, type, fallback_value }) => ({
+          key,
+          type,
+          fallback_value,
+        })),
       });
     }
     return {
@@ -371,13 +365,16 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
     values: string[],
     extra: Record<string, unknown> = {},
   ): Promise<SuppressionsOutcome> {
-    const out: SuppressionsOutcome = { ids: [], errors: [] };
+    const out: SuppressionsOutcome = { ids: [], notRemoved: [], errors: [] };
     const chunks = chunk(values, BATCH_MAX);
     for (const [n, slice] of chunks.entries()) {
-      const result = await write(async () => ({
-        data: (await api.post<{ data: { id: string }[] }>(path, { [key]: slice, ...extra })).body
-          .data,
-      }));
+      const result = await write(async () => {
+        const { body } = await api.post<{
+          data: { id: string }[];
+          not_removed?: { id: string; reason: string }[];
+        }>(path, { [key]: slice, ...extra });
+        return { data: body.data, notRemoved: body.not_removed ?? [] };
+      });
       if (!result.ok) {
         log.warn(`${path} ${n + 1}/${chunks.length} failed: ${result.message}`);
         for (const i of slice.keys()) {
@@ -390,6 +387,7 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
         continue;
       }
       out.ids.push(...result.data.map((r) => r.id));
+      out.notRemoved.push(...result.notRemoved);
     }
     return out;
   }
@@ -529,18 +527,24 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
     createTemplate: (input: {
       name: string;
       alias?: string | null | undefined;
+      from?: string | null | undefined;
+      reply_to?: string[] | null | undefined;
       subject?: string | null | undefined;
       html: string;
       text?: string | null | undefined;
+      variables?: TemplateVariableInput[] | undefined;
     }) =>
       write(() =>
         id(
           api.post("/templates", {
             name: input.name,
             alias: input.alias ?? undefined,
+            from: input.from ?? undefined,
+            reply_to: input.reply_to ?? undefined,
             subject: input.subject ?? undefined,
             html: input.html,
             text: input.text ?? undefined,
+            variables: input.variables ?? undefined,
           }),
         ),
       ),
@@ -550,9 +554,12 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
       input: {
         name?: string | undefined;
         alias?: string | null | undefined;
+        from?: string | null | undefined;
+        reply_to?: string[] | null | undefined;
         subject?: string | null | undefined;
         html?: string | undefined;
         text?: string | null | undefined;
+        variables?: TemplateVariableInput[] | undefined;
       },
     ) => write(() => id(api.patch(`/templates/${idOrAlias}`, input))),
     deleteTemplate: (idOrAlias: string) => write(() => id(api.delete(`/templates/${idOrAlias}`))),

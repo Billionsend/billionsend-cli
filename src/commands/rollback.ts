@@ -34,8 +34,10 @@ export async function rollback(ctx: Context): Promise<number> {
   const state = readJson<MigrateState>(paths.state);
   const pending = ROLLBACK_ORDER.filter((r) => (state?.created[r]?.length ?? 0) > 0);
   const deleted: Partial<Record<Resource, number>> = {};
+  /** Rows the API keeps: a bounce or complaint suppression is permanent. */
+  const kept: Partial<Record<Resource, number>> = {};
   const emitJson = (failures: MigrateState["failures"]): void => {
-    if (config.json) ctx.stdout.write(`${JSON.stringify({ deleted, failures })}\n`);
+    if (config.json) ctx.stdout.write(`${JSON.stringify({ deleted, kept, failures })}\n`);
   };
   if (state === null || pending.length === 0) {
     out.write(`Nothing to roll back: no ids created by this tool in ${STATE_DIR}/.\n`);
@@ -96,16 +98,19 @@ export async function rollback(ctx: Context): Promise<number> {
     };
     const step = ctx.progress.step(RESOURCE_LABEL[resource]);
     let failed = 0;
+    let permanent = 0;
     if (resource === "suppressions") {
-      const { ids: removed, errors } = await target.removeSuppressions(ids);
-      const kept = new Set<number>();
+      const { ids: removed, notRemoved, errors } = await target.removeSuppressions(ids);
+      permanent = notRemoved.length;
+      const heldBack = new Set<number>();
       for (const error of errors) {
-        kept.add(error.index);
+        heldBack.add(error.index);
         failed += 1;
         state.failures.push({ resource, key: ids[error.index] ?? "?", message: error.message });
       }
       // A chunk that went through removed every id in it; rows already gone are not echoed back.
-      for (const [i, id] of ids.entries()) if (!kept.has(i)) remaining.delete(id);
+      // Rows the API left in place are permanent (bounces, complaints): there is nothing to retry.
+      for (const [i, id] of ids.entries()) if (!heldBack.has(i)) remaining.delete(id);
       step.update(removed.length, ids.length);
     } else {
       const del = DELETE[resource];
@@ -121,7 +126,8 @@ export async function rollback(ctx: Context): Promise<number> {
         if ((n + 1) % SAVE_EVERY === 0) save();
       }
     }
-    deleted[resource] = ids.length - remaining.size;
+    deleted[resource] = ids.length - remaining.size - permanent;
+    if (permanent > 0) kept[resource] = permanent;
     // What a run resumed from no longer exists on the target.
     if (resource === "contacts") state.progress = {};
     save();
@@ -139,5 +145,10 @@ export async function rollback(ctx: Context): Promise<number> {
     return 3;
   }
   out.write("\nRolled back. Rows this tool only updated were left as they are.\n");
+  if (kept.suppressions !== undefined) {
+    out.write(
+      `${pluralize(kept.suppressions, "suppression")} stay: a bounce or complaint entry is permanent and BillionSend does not remove it.\n`,
+    );
+  }
   return 0;
 }

@@ -10,6 +10,7 @@ import {
   estimateSourceRequests,
   resendBaseUrl,
   type SourceProgress,
+  selectSegments,
 } from "../src/providers/resend.js";
 import { type FakeContact, type FakeResend, startFakeResend } from "./helpers/fake-resend.js";
 
@@ -54,6 +55,37 @@ beforeEach(() => {
 });
 
 describe("createResendSource", () => {
+  it("readShallow with segments reads only those segments' member lists and never GET /contacts", async () => {
+    const { src } = source();
+    const snapshot = await src.readShallow({
+      include: ALL,
+      segments: ["Active Users"],
+    });
+    expect(snapshot.segmentScope).toEqual([
+      { id: "78261eea-8f8b-4381-83c6-79fa7120f1cf", name: "Active Users" },
+    ]);
+    expect(snapshot.segments.map((s) => [s.name, s.memberEmails])).toEqual([
+      ["Active Users", ["steve.wozniak@gmail.com", "ada@example.org"]],
+    ]);
+    expect(snapshot.contacts.map((c) => c.email)).toEqual([
+      "steve.wozniak@gmail.com",
+      "ada@example.org",
+    ]);
+    const paths = fake.requests.map((r) => r.path);
+    expect(paths).not.toContain("/contacts");
+    expect(paths.filter((p) => p.endsWith("/contacts"))).toEqual([
+      "/segments/78261eea-8f8b-4381-83c6-79fa7120f1cf/contacts",
+    ]);
+  });
+
+  it("readShallow stops on an unknown segment before reading anything else, listing the segments", async () => {
+    const { src } = source();
+    await expect(src.readShallow({ include: ALL, segments: ["Nope"] })).rejects.toThrow(
+      /`Nope`.*\n {2}Active Users {2}\(78261eea/s,
+    );
+    expect(fake.requests.map((r) => r.path)).toEqual(["/segments"]);
+  });
+
   it("probe returns ok with the first domain as a hint", async () => {
     const { src } = source();
     await expect(src.probe()).resolves.toEqual({ ok: true, teamHint: "example.com" });
@@ -230,9 +262,7 @@ describe("createResendSource", () => {
         usage: {
           plan: null,
           limits: { emailsPerDay: null, emailsPerMonth: null, domains: null, contacts: null },
-          today: { emailsSent: 0 },
-          period: null,
-          appUrl: null,
+          overageEnabled: false,
         },
         domains: [],
         properties: [],
@@ -247,6 +277,10 @@ describe("createResendSource", () => {
         target,
         options: {
           include: new Set(["domains"]),
+          only: null,
+          skip: [],
+          segment: [],
+          onConflict: "upsert",
           includeSent: false,
           freshWebhookSecrets: false,
           rps: 8,
@@ -522,5 +556,24 @@ describe("providers registry", () => {
     // The app-side cutover variable must never redirect the Resend key.
     expect(resendBaseUrl({ RESEND_BASE_URL: "http://127.0.0.1:9" })).toBe("https://api.resend.com");
     expect(providers.resend.create).toBe(createResendSource);
+  });
+});
+
+describe("selectSegments", () => {
+  const all = [
+    { id: "id-1", name: "VIP" },
+    { id: "id-2", name: "Beta" },
+    { id: "id-3", name: "beta" },
+  ];
+  it("matches an id first, then the exact name, then the name ignoring case; each once", () => {
+    expect(selectSegments(all, ["id-2", "Beta", "VIP"]).map((s) => s.id)).toEqual(["id-2", "id-1"]);
+    expect(selectSegments(all, ["BETA"]).map((s) => s.id)).toEqual(["id-2", "id-3"]);
+    expect(selectSegments(all, ["beta"]).map((s) => s.id)).toEqual(["id-3"]);
+  });
+  it("names everything that matched nothing and what is there", () => {
+    expect(() => selectSegments(all, ["x", "VIP", "y"])).toThrow(
+      "No Resend segment named or with the id `x`, `y`. Segments on the account:\n  VIP  (id-1)\n  Beta  (id-2)\n  beta  (id-3)",
+    );
+    expect(() => selectSegments([], ["x"])).toThrow("The account has no segments.");
   });
 });

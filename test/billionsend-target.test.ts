@@ -63,25 +63,17 @@ const ids = {} as Record<
 >;
 
 beforeAll(async () => {
-  cloud = await startContractApi({ appBaseUrl: "https://app.example.test" });
+  cloud = await startContractApi();
   target = targetFor(cloud);
 });
 afterAll(() => cloud.stop());
 
 describe("probe", () => {
-  it("reads the plan and limits on Cloud", async () => {
+  it("reads the plan and limits", async () => {
     expect(await target.probe()).toEqual({
       plan: "pro",
       limits: { emailsPerDay: null, emailsPerMonth: 60_000, domains: null, contacts: null },
-      today: { emailsSent: 0 },
-      period: {
-        emailsSent: 0,
-        included: 60_000,
-        overageEnabled: true,
-        startsAt: expect.any(String),
-        endsAt: expect.any(String),
-      },
-      appUrl: "https://app.example.test",
+      overageEnabled: true,
     });
     expect(target.requests).toBe(1);
   });
@@ -92,7 +84,7 @@ describe("probe", () => {
       expect(await targetFor(free).probe()).toMatchObject({
         plan: "free",
         limits: { emailsPerDay: 100, emailsPerMonth: null, domains: 3, contacts: 1000 },
-        period: null,
+        overageEnabled: false,
       });
     } finally {
       await free.stop();
@@ -265,7 +257,7 @@ describe("writers", () => {
     expect(
       await target.createWebhook({
         endpoint: "https://hooks.example.test/c",
-        events: ["domain.created"],
+        events: ["domain.verified"],
       }),
     ).toMatchObject({ ok: false, status: 422 });
   });
@@ -275,9 +267,12 @@ describe("writers", () => {
       await target.createTemplate({
         name: "Welcome",
         alias: "welcome",
+        from: "Acme <hi@acme.dev>",
+        reply_to: ["help@acme.dev"],
         subject: "Hi {{{FIRST_NAME|there}}}",
         html: "<p>Welcome</p>",
         text: null,
+        variables: [{ key: "plan", type: "string", fallback_value: "free" }],
       }),
     ).id;
     expect(await target.updateTemplate("welcome", { html: "<p>Welcome back</p>" })).toEqual({
@@ -465,9 +460,12 @@ describe("readState", () => {
         id: ids.template,
         name: "Welcome",
         alias: "welcome",
+        from: "Acme <hi@acme.dev>",
+        replyTo: ["help@acme.dev"],
         subject: "Hi {{{FIRST_NAME|there}}}",
         html: "<p>Welcome back</p>",
         text: null,
+        variables: [{ key: "plan", type: "string", fallback_value: "free" }],
       },
     ]);
     expect(state.broadcasts).toEqual([{ id: ids.broadcast, name: "Launch", status: "draft" }]);
@@ -496,12 +494,17 @@ describe("readState", () => {
       suppressions: [],
       metrics: { emailsLast30Days: null },
       enriched: false,
+      segmentScope: null,
     };
     const plan = buildPlan({
       snapshot,
       target: state,
       options: {
         include: new Set(["webhooks"]),
+        only: null,
+        skip: [],
+        segment: [],
+        onConflict: "upsert",
         includeSent: false,
         freshWebhookSecrets: false,
         rps: 8,
@@ -559,12 +562,19 @@ describe("rollback deletes", () => {
       status: 404,
     });
 
+    // A bounce entry is permanent: the API leaves it and lists it in not_removed; a manual one goes.
+    const manual = await target.addSuppressions(["leaver@example.com"], "manual");
     const removed = await target.removeSuppressions([
       ids.suppression,
       ids.suppression2,
+      ...manual.ids,
       "00000000-0000-4000-8000-000000000000",
     ]);
-    expect(removed.ids.sort()).toEqual([ids.suppression, ids.suppression2].sort());
+    expect(removed.ids).toEqual(manual.ids);
+    expect(removed.notRemoved.map((n) => n.id).sort()).toEqual(
+      [ids.suppression, ids.suppression2].sort(),
+    );
+    expect(removed.notRemoved.every((n) => n.reason === "permanent")).toBe(true);
     expect(removed.errors).toEqual([]);
 
     const state = await target.readState();

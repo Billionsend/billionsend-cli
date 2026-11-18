@@ -151,16 +151,16 @@ describe("translateWebhookEvents", () => {
     expect(
       translateWebhookEvents([
         "email.sent",
-        "topic.created",
+        "template.created",
         "email.sent",
-        "domain.created",
+        "audience.created",
         "email.clicked",
         "email.received",
         "contact.created",
       ]),
     ).toEqual({
       events: ["email.sent", "email.clicked", "email.received", "contact.created"],
-      dropped: ["topic.created", "domain.created"],
+      dropped: ["template.created", "audience.created"],
     });
   });
 
@@ -180,18 +180,36 @@ describe("translateWebhookEvents", () => {
       "contact.created",
       "contact.updated",
       "contact.deleted",
+      "contact.topics.updated",
       "suppression.added",
       "suppression.removed",
+      "domain.created",
+      "domain.updated",
+      "domain.deleted",
+      "topic.created",
+      "topic.updated",
+      "topic.deleted",
     ];
     expect(translateWebhookEvents(all)).toEqual({ events: all, dropped: [] });
   });
 
-  it("carries Resend's inbox events over, but not the assignment ones BillionSend never emits", () => {
+  it("carries Resend's inbox events over, assignment included, and drops names BillionSend has no event for", () => {
     expect(
-      translateWebhookEvents(["inbox.email.received", "inbox.thread.assigned", "inbox.draft.sent"]),
+      translateWebhookEvents([
+        "inbox.email.received",
+        "inbox.thread.assigned",
+        "inbox.thread.unassigned",
+        "inbox.thread.archived",
+        "inbox.draft.sent",
+      ]),
     ).toEqual({
-      events: ["inbox.email.received", "inbox.draft.sent"],
-      dropped: ["inbox.thread.assigned"],
+      events: [
+        "inbox.email.received",
+        "inbox.thread.assigned",
+        "inbox.thread.unassigned",
+        "inbox.draft.sent",
+      ],
+      dropped: ["inbox.thread.archived"],
     });
   });
 
@@ -283,7 +301,7 @@ describe("templateCreateInput", () => {
     });
   });
 
-  it("notes from, reply_to, variables and untranslatable tags", () => {
+  it("carries from, reply_to and variables over and notes variables it cannot store and untranslatable tags", () => {
     const t = template({
       alias: null,
       from: "Acme <hi@example.com>",
@@ -292,20 +310,40 @@ describe("templateCreateInput", () => {
       text: null,
       subject: null,
       variables: [
-        { key: "first_name", type: "string" },
+        { key: "first_name", type: "string", fallbackValue: "friend" },
         { key: "items", type: "list" },
+        { key: "bad key", type: "string" },
       ],
     });
     expect(templateCreateInput(t)).toEqual({
-      input: { name: "Welcome", html: "<p>{{{foo bar}}}</p>" },
+      input: {
+        name: "Welcome",
+        from: "Acme <hi@example.com>",
+        reply_to: ["a@example.com", "b@example.com"],
+        html: "<p>{{{foo bar}}}</p>",
+        variables: [{ key: "first_name", type: "string", fallback_value: "friend" }],
+      },
       notes: [
-        "from Acme <hi@example.com> is not stored on templates; pass it when sending",
-        "reply_to a@example.com, b@example.com is not stored on templates; pass it when sending",
-        "variables first_name, items are not stored; merge fields resolve from contact properties",
+        "variables bad key not stored: a key is 1–50 letters, digits or underscores",
+        "variables items (list) not stored: BillionSend variables are strings or numbers",
         "merge tags left as-is: {{{foo bar}}}",
       ],
       reason: null,
     });
+  });
+
+  it("keeps the first 50 of a longer Reply-To list and variable list, and says so", () => {
+    const t = template({
+      replyTo: Array.from({ length: 52 }, (_, i) => `r${i}@example.com`),
+      variables: Array.from({ length: 51 }, (_, i) => ({ key: `v${i}`, type: "string" })),
+    });
+    const { input, notes } = templateCreateInput(t);
+    expect(input?.reply_to).toHaveLength(50);
+    expect(input?.variables).toHaveLength(50);
+    expect(notes).toEqual([
+      "reply_to has 52 addresses; a template stores 50, the first 50 were kept",
+      "51 variables; a template stores 50, the first 50 were kept",
+    ]);
   });
 
   it("refuses a template without html", () => {

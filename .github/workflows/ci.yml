@@ -5,8 +5,8 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # Weekly: is the OpenAPI snapshot still the published one?
-    - cron: "17 6 * * 1"
+    # Daily: is the OpenAPI snapshot still the published one?
+    - cron: "17 6 * * *"
 
 permissions:
   contents: read

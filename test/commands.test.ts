@@ -119,10 +119,7 @@ function expectNoSecrets(...texts: string[]): void {
 beforeAll(async () => {
   // main() runs in-process with color mode auto: the host shell's FORCE_COLOR would paint every transcript.
   delete process.env.FORCE_COLOR;
-  [fake, api] = await Promise.all([
-    startFakeResend(),
-    startContractApi({ appBaseUrl: "https://app.example.test" }),
-  ]);
+  [fake, api] = await Promise.all([startFakeResend(), startContractApi()]);
   cwd = mkdtempSync(join(tmpdir(), "billionsend-cli-"));
   writeFileSync(join(cwd, ".gitignore"), "node_modules\n");
 });
@@ -154,7 +151,7 @@ describe("billionsend migrate", () => {
       expect(stderr).toBe("");
       expect(code).toBe(0);
       expect(stdout).toContain("✓ Resend · connected");
-      expect(stdout).toContain("✓ BillionSend Cloud · plan Pro");
+      expect(stdout).toContain(`✓ BillionSend (${api.baseUrl}) · plan Pro`);
       expect(stdout).toContain("Plan: ");
       expect(stdout).toContain("Resend was only read; nothing there was changed.");
       expect(stdout).toContain("contacts created");
@@ -250,11 +247,7 @@ describe("billionsend migrate", () => {
   it(
     "on a Free team a domain's own tracking host is a warning: the domain is created, the run goes on, exit 3",
     async () => {
-      const free = await startContractApi({
-        slug: "free-team",
-        plan: "free",
-        appBaseUrl: "https://app.example.test",
-      });
+      const free = await startContractApi({ slug: "free-team", plan: "free" });
       const dir = mkdtempSync(join(tmpdir(), "billionsend-cli-free-"));
       try {
         const { code, stdout, stderr } = await run(["migrate", "--from", "resend", "--yes"], {
@@ -262,14 +255,16 @@ describe("billionsend migrate", () => {
           env: { BILLIONSEND_API_KEY: free.apiKey, BILLIONSEND_BASE_URL: free.baseUrl },
         });
         expect(code).toBe(3);
-        expect(stderr).toBe(
-          "warning: domains/example.com: created, but tracking settings failed: A tracking or unsubscribe subdomain of your own needs a paid plan\n",
+        // The failure is listed once, in the summary; stderr carries no second copy.
+        expect(stderr).toBe("");
+        expect(stdout.replace(/\s+/g, " ")).toContain(
+          "✗ domains/example.com — created, but tracking settings failed: A tracking or unsubscribe subdomain of your own needs a paid plan",
         );
-        expect(stdout).toContain("✓ BillionSend Cloud · plan Free");
+        expect(stdout).toContain(`✓ BillionSend (${free.baseUrl}) · plan Free`);
         expect(stdout.replace(/\n/g, " ")).toContain(
           "Free allows 3,000/month; Pro 60K (60,000/month, unlimited domains) fits.",
         );
-        expect(stdout).toContain("https://app.example.test/settings/billing");
+        expect(stdout).toContain("https://billionsend.com/settings/billing");
 
         const state = readState(dir);
         expect(state?.failures).toEqual([
@@ -318,7 +313,7 @@ describe("billionsend migrate", () => {
       const report = readReport();
       expect(report.counts.topics).toMatchObject({ created: 0, unchanged: 2 });
       expect(report.counts.domains).toMatchObject({ created: 0, unchanged: 2 });
-      expect(report.counts.contacts).toMatchObject({ created: 0, updated: 3 });
+      expect(report.counts.contacts).toMatchObject({ created: 0, updated: 0, matched: 3 });
       expect(report.counts.suppressions).toMatchObject({ created: 0, unchanged: 3 });
       expect(await apiList("/topics")).toHaveLength(2);
     },
@@ -333,7 +328,7 @@ describe("billionsend migrate", () => {
       expect(changes.code).toBe(2);
       expect(changes.stdout).toContain("contacts (3)\n  + contacts  batch upsert");
       const plan = JSON.parse(readFileSync(out, "utf8")) as Plan;
-      expect(plan.version).toBe(1);
+      expect(plan.version).toBe(2);
       expect(plan.target.baseUrl).toBe(api.baseUrl);
       expect(JSON.stringify(plan)).not.toContain("whsec_");
 
@@ -412,7 +407,7 @@ describe("billionsend migrate", () => {
     "a failed item is exit 3, listed, and does not stop the run",
     async () => {
       fake.data.contacts.push(notAnEmail);
-      const { code, stdout } = await run([
+      const { code, stdout, stderr } = await run([
         "migrate",
         "--from",
         "resend",
@@ -423,7 +418,9 @@ describe("billionsend migrate", () => {
       fake.data.contacts.pop();
       expect(code).toBe(3);
       expect(stdout).toContain("✗ Contacts — 1 of 4 failed");
-      expect(stdout).toContain("contacts/not-an-email");
+      // One line in the failure list, none on stderr.
+      expect(stdout.split("\n").filter((l) => l.includes("contacts/not-an-email"))).toHaveLength(1);
+      expect(stderr).not.toContain("not-an-email");
       const state = readState();
       expect(state?.failures).toEqual([
         {
@@ -542,10 +539,13 @@ describe("billionsend migrate", () => {
         "/domains",
         "/webhooks",
         "/templates",
-        "/suppressions",
       ]) {
         expect(await apiList(path), path).toEqual([]);
       }
+      // A bounce or complaint suppression is permanent on BillionSend: rollback says so and leaves it.
+      const left = await apiList<{ origin: string }>("/suppressions");
+      expect(left.map((s) => s.origin).sort()).toEqual(["bounce", "complaint"]);
+      expect(stdout).toContain("2 suppressions stay: a bounce or complaint entry is permanent");
       const again = await run(["migrate", "rollback", "--yes"]);
       expect(again.code).toBe(0);
       expect(again.stdout).toContain("Nothing to roll back");
@@ -587,7 +587,7 @@ describe("billionsend migrate", () => {
 
 describe("enrichmentItem", () => {
   const maps = {
-    propertyKeys: new Set(["plan"]),
+    propertyKeys: new Map([["plan", "plan"]]),
     topicBySource: new Map([["src-news", "tgt-news"]]),
   };
   const contact: SourceContact = {
@@ -622,6 +622,28 @@ describe("enrichmentItem", () => {
       { id: "tgt-news", subscription: "opt_out" },
     ]);
   });
+
+  it("a contact still waiting for its first enrichment also gets the opt-ins on topics that default to opt_out", () => {
+    const withDefaults = { ...maps, optOutByDefault: new Set(["src-news"]) };
+    expect(enrichmentItem(contact, "pending", withDefaults).topics).toEqual([
+      { id: "tgt-news", subscription: "opt_in" },
+    ]);
+    // An opt-in on a topic that defaults to opt_in could undo an opt-out made since: not sent.
+    expect(enrichmentItem(contact, "pending", maps).topics).toBeUndefined();
+    // A synced contact never gets one, whatever the topic's default.
+    expect(enrichmentItem(contact, "updated", withDefaults).topics).toBeUndefined();
+  });
+
+  it("writes a property under the spelling the target has, and leaves a colliding key out", () => {
+    const keyed = {
+      ...maps,
+      propertyKeys: new Map([["plan", "Plan"]]),
+    };
+    expect(
+      enrichmentItem({ ...contact, properties: { plan: "pro", PLAN: "Pro" } }, "created", keyed)
+        .properties,
+    ).toEqual({ Plan: "pro" });
+  });
 });
 
 describe("migrate rollback", () => {
@@ -631,7 +653,12 @@ describe("migrate rollback", () => {
       headers: { "content-type": "application/json" },
     });
 
-  async function runWithFetch(argv: string[], dir: string, fetchFn: typeof fetch) {
+  async function runWithFetch(
+    argv: string[],
+    dir: string,
+    fetchFn: typeof fetch,
+    extraEnv: Record<string, string> = {},
+  ) {
     const input = new PassThrough();
     input.end("");
     const stdout = collector();
@@ -640,7 +667,7 @@ describe("migrate rollback", () => {
       stdin: input,
       stdout: stdout.stream,
       stderr: stderr.stream,
-      env: env(),
+      env: env(extraEnv),
       cwd: dir,
       fetch: fetchFn,
     });
@@ -702,7 +729,7 @@ describe("migrate rollback", () => {
         cwd: dir,
       });
       expect(code).toBe(0);
-      expect(JSON.parse(stdout)).toEqual({ deleted: { contacts: 5 }, failures: [] });
+      expect(JSON.parse(stdout)).toEqual({ deleted: { contacts: 5 }, kept: {}, failures: [] });
       // The plain header wraps at the layout width (80 here) with a hanging indent.
       expect(stderr).toContain(
         "— Deletes what an earlier run created on your BillionSend\n  instance; nothing on Resend is touched.\n",
@@ -715,37 +742,54 @@ describe("migrate rollback", () => {
 
       const empty = await run(["migrate", "rollback", "--yes", "--json"], { cwd: dir });
       expect(empty.code).toBe(0);
-      expect(JSON.parse(empty.stdout)).toEqual({ deleted: {}, failures: [] });
+      expect(JSON.parse(empty.stdout)).toEqual({ deleted: {}, kept: {}, failures: [] });
       expect(empty.stderr).toContain("Nothing to roll back");
     },
     SLOW,
   );
 
   it(
-    "keeps suppression ids in the state when the batch remove fails",
+    "keeps suppression ids in the state when the batch remove fails, and leaves a permanent one standing",
     async () => {
-      const dir = mkdtempSync(join(tmpdir(), "billionsend-cli-rb-"));
-      const migrated = await run(
-        ["migrate", "--from", "resend", "--yes", "--only", "suppressions"],
-        { cwd: dir },
-      );
-      expect(migrated.code).toBe(0);
-      expect(readState(dir)?.created.suppressions).toHaveLength(3);
+      // Its own target: bounce and complaint suppressions are permanent and would outlive every other test's rollback.
+      const own = await startContractApi({ slug: "suppression-rollback" });
+      const target = { BILLIONSEND_API_KEY: own.apiKey, BILLIONSEND_BASE_URL: own.baseUrl };
+      try {
+        const dir = mkdtempSync(join(tmpdir(), "billionsend-cli-rb-"));
+        const migrated = await run(
+          ["migrate", "--from", "resend", "--yes", "--only", "suppressions"],
+          { cwd: dir, env: target },
+        );
+        expect(migrated.code).toBe(0);
+        expect(readState(dir)?.created.suppressions).toHaveLength(3);
 
-      const rejectRemove: typeof fetch = (url, init) =>
-        String(url).endsWith("/suppressions/batch/remove")
-          ? Promise.resolve(rejectJson())
-          : fetch(url, init);
-      const failedRun = await runWithFetch(["migrate", "rollback", "--yes"], dir, rejectRemove);
-      expect(failedRun.code).toBe(3);
-      expect(failedRun.stdout).toContain("the ids stay in");
-      expect(readState(dir)?.created.suppressions).toHaveLength(3);
-      expect(readState(dir)?.failures).toHaveLength(3);
+        const rejectRemove: typeof fetch = (url, init) =>
+          String(url).endsWith("/suppressions/batch/remove")
+            ? Promise.resolve(rejectJson())
+            : fetch(url, init);
+        const failedRun = await runWithFetch(
+          ["migrate", "rollback", "--yes"],
+          dir,
+          rejectRemove,
+          target,
+        );
+        expect(failedRun.code).toBe(3);
+        expect(failedRun.stdout).toContain("the ids stay in");
+        expect(readState(dir)?.created.suppressions).toHaveLength(3);
+        expect(readState(dir)?.failures).toHaveLength(3);
 
-      const again = await run(["migrate", "rollback", "--yes"], { cwd: dir });
-      expect(again.code).toBe(0);
-      expect(readState(dir)?.created.suppressions).toEqual([]);
-      expect(await apiList("/suppressions")).toEqual([]);
+        const again = await run(["migrate", "rollback", "--yes"], { cwd: dir, env: target });
+        expect(again.code).toBe(0);
+        expect(readState(dir)?.created.suppressions).toEqual([]);
+        // The manual entry is gone; the bounce and the complaint are permanent and are said to stay.
+        const left = await apiList<{ origin: string }>("/suppressions", own.apiKey, own.baseUrl);
+        expect(left.map((s) => s.origin).sort()).toEqual(["bounce", "complaint"]);
+        expect(again.stdout).toContain(
+          "2 suppressions stay: a bounce or complaint entry is permanent",
+        );
+      } finally {
+        await own.stop();
+      }
     },
     SLOW,
   );
@@ -855,6 +899,7 @@ describe("plan, apply and status edge cases (own target)", () => {
       const report = JSON.parse(json.stdout) as Report;
       expect(report.counts["api-keys"]).toEqual({
         created: 0,
+        matched: 0,
         updated: 0,
         unchanged: 0,
         skipped: 0,

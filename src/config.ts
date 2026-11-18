@@ -18,6 +18,17 @@ export interface KeyInput {
 /** Mirrors the API's `on_conflict` for POST /contacts/batch. */
 export type OnConflict = "upsert" | "skip" | "error";
 
+/** The options that decide what a plan contains; a plan file records them and `apply` follows them. */
+export const PLAN_OPTIONS = [
+  "only",
+  "skip",
+  "segment",
+  "on-conflict",
+  "include-sent",
+  "fresh-webhook-secrets",
+] as const;
+export type PlanOption = (typeof PLAN_OPTIONS)[number];
+
 export interface Config {
   command: Command;
   /** `migrate apply <file>` */
@@ -25,13 +36,17 @@ export interface Config {
   from: ProviderId | null;
   fromKey: KeyInput;
   toKey: KeyInput;
-  /** Trailing slash stripped; BillionSend Cloud unless --to-url / BILLIONSEND_BASE_URL says otherwise. */
+  /** Trailing slash stripped; The default API URL unless --to-url / BILLIONSEND_BASE_URL says otherwise. */
   toUrl: string;
   rps: number;
   /** --rps was passed: the limit detected on connect then never changes the rate. */
   rpsGiven: boolean;
   only: Resource[] | null;
   skip: Resource[];
+  /** --segment: Resend segments (names or ids) to migrate; empty = the whole account. */
+  segment: string[];
+  /** Which of PLAN_OPTIONS the command line set itself (a default is not given). */
+  given: ReadonlySet<PlanOption>;
   onConflict: OnConflict;
   yes: boolean;
   nonInteractive: boolean;
@@ -78,6 +93,7 @@ const OPTIONS = {
   rps: { type: "string" },
   only: { type: "string" },
   skip: { type: "string" },
+  segment: { type: "string", multiple: true },
   "on-conflict": { type: "string" },
   yes: { type: "boolean", short: "y" },
   "non-interactive": { type: "boolean" },
@@ -112,6 +128,15 @@ function resourceList(flag: string, value: string | undefined): Resource[] | nul
     }
   }
   return names as Resource[];
+}
+
+/** `--segment a --segment "b,c"` → [a, b, c]; names with a comma can be given by id. */
+function segmentList(value: string[] | undefined): string[] {
+  const names = (value ?? []).flatMap((entry) => entry.split(",")).map((name) => name.trim());
+  if (names.includes("")) {
+    throw new ConfigError("--segment needs a segment name or id (an empty value was given).");
+  }
+  return [...new Set(names)];
 }
 
 function keyInput(
@@ -290,6 +315,8 @@ export function parseConfig(
     rpsGiven,
     only: resourceList("--only", values.only),
     skip: resourceList("--skip", values.skip) ?? [],
+    segment: segmentList(values.segment),
+    given: new Set(PLAN_OPTIONS.filter((name) => values[name] !== undefined)),
     onConflict,
     yes: values.yes === true,
     nonInteractive,
@@ -317,6 +344,8 @@ function minimal(command: "help" | "version"): Config {
     rpsGiven: false,
     only: null,
     skip: [],
+    segment: [],
+    given: new Set(),
     onConflict: "upsert",
     yes: false,
     nonInteractive: true,
@@ -338,7 +367,7 @@ export function helpText(): string {
 Usage
   billionsend migrate --from resend                          connect, choose resources, plan, confirm, apply, summary
   billionsend migrate plan --from resend [--out plan.json]   read-only; exit 0 nothing to do, 2 changes, 1 error
-  billionsend migrate apply [plan.json] [--yes]              apply a saved plan, or plan and apply in one go
+  billionsend migrate apply [plan.json] [--yes]              apply a saved plan (with the options it was made with), or plan and apply in one go
   billionsend migrate status                                 what the last run created and what is left
   billionsend migrate rollback [--yes]                       delete only what this tool created
   billionsend --help | --version
@@ -355,12 +384,14 @@ Options
                              Go past ${MAX_RPS} only after Resend raised your limit (up to ${RPS_CEILING})
   --only <a,b>               migrate only these resources
   --skip <a,b>               skip these resources; \`enrichment\` is the per-contact properties/topics pass
+  --segment <name|id>        only these Resend segments: the segments, their members and the members' enrichment.
+                             Repeat the flag or separate with commas; an unknown name or id exits 1 and lists the segments
   --on-conflict <mode>       contacts that already exist on the target: upsert (default), skip, error
   --include-sent             import sent broadcasts as drafts (skipped by default)
   --fresh-webhook-secrets    mint new webhook signing secrets instead of copying them (shown once in the report)
   --fresh                    ignore resume progress; keeps what earlier runs created so rollback still works
   --out <file>               \`migrate plan\`: write the plan as JSON
-  --report <file>            also write the Markdown report to this path
+  --report <file>            also write the Markdown report to this path (\`migrate plan\`: the plan as Markdown)
   -y, --yes                  skip confirmations
   --non-interactive          never prompt; a missing input is exit 1 (automatic when stdin is not a terminal, and with --json)
   --json                     JSON on stdout, progress on stderr

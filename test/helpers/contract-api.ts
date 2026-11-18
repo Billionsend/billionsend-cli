@@ -99,9 +99,18 @@ export interface Store {
       id: string;
       name: string;
       alias: string | null;
+      from: string | null;
+      replyTo: string[] | null;
       subject: string | null;
       html: string;
       text: string | null;
+      variables: {
+        key: string;
+        type: "string" | "number";
+        fallback_value: string | number | null;
+        created_at: string;
+        updated_at: string;
+      }[];
       createdAt: string;
       updatedAt: string;
     }
@@ -227,11 +236,10 @@ const fail = (status: number, name: string, message: string): never => {
 const notFound = (what: string): never => fail(404, "not_found", `${what} not found`);
 
 export async function startContractApi(
-  options: { appBaseUrl?: string; plan?: Plan; sharedInboxDomain?: string; slug?: string } = {},
+  options: { plan?: Plan; sharedInboxDomain?: string; slug?: string } = {},
 ): Promise<ContractApi> {
   const plan = options.plan ?? "pro";
   const limits = PLAN_LIMITS[plan];
-  const teamId = randomUUID();
   const keys = new Map<string, Permission>();
   const mintKey = (permission: Permission = "full_access") => {
     const token = `bs_${randomBytes(18).toString("base64url")}`;
@@ -397,6 +405,7 @@ export async function startContractApi(
     },
     capabilities: { sending: "enabled", receiving: "disabled" },
     receiving_catch_all: false,
+    send_transactional_to_unsubscribed: false,
     shared: d.shared,
     sending_mode: d.shared ? "reply_only" : "open",
     sending_mode_reason: null,
@@ -621,6 +630,23 @@ export async function startContractApi(
     return results;
   };
 
+  /** reply_to takes one address or a list; the answer is always a list, null when none. */
+  const asList = (value: unknown): string[] | null =>
+    value === undefined || value === null ? null : Array.isArray(value) ? value : [String(value)];
+  const templateVariables = (
+    input:
+      | { key: string; type: "string" | "number"; fallback_value?: string | number | null }[]
+      | undefined,
+    at: string,
+  ) =>
+    (input ?? []).map((v) => ({
+      key: v.key,
+      type: v.type,
+      fallback_value: v.fallback_value ?? null,
+      created_at: at,
+      updated_at: at,
+    }));
+
   const deleteContact = (id: string) => {
     store.contacts.delete(id);
     store.topicSubscriptions.delete(id);
@@ -644,29 +670,45 @@ export async function startContractApi(
   const handlers: Record<string, Handler> = {
     "GET /usage": () => {
       const start = "2026-01-01T00:00:00.000Z";
+      const monthly = limits.emailsPerMonth !== null;
       return {
         object: "usage",
-        plan,
-        limits: {
-          emails_per_day: limits.emailsPerDay,
-          emails_per_month: limits.emailsPerMonth,
-          domains: limits.domains,
-          contacts: limits.contacts,
-          inboxes: plan === "free" ? 1 : null,
-          webhook_endpoints: limits.webhookEndpoints,
+        emails: {
+          daily: {
+            used: 0,
+            limit: limits.emailsPerDay,
+            sent: 0,
+            received: 0,
+            resets_at: "2026-01-02T00:00:00.000Z",
+          },
+          monthly: {
+            used: 0,
+            limit: limits.emailsPerMonth,
+            sent: 0,
+            received: 0,
+            resets_at: "2026-02-01T00:00:00.000Z",
+            starts_at: start,
+            overage_enabled: monthly,
+            overage_usd_per_1k: monthly ? 0.6 : null,
+          },
         },
-        today: { emails_sent: 0, resets_at: "2026-01-02T00:00:00.000Z" },
-        period:
-          limits.emailsPerMonth === null
-            ? null
-            : {
-                emails_sent: 0,
-                included: limits.emailsPerMonth,
-                overage_enabled: true,
-                overage_usd_per_1k: 0.6,
-                starts_at: start,
-                ends_at: "2026-02-01T00:00:00.000Z",
-              },
+        contacts: { used: store.contacts.size, limit: limits.contacts },
+        segments: { used: store.segments.size, limit: null },
+        broadcasts: { used: store.broadcasts.size, limit: null },
+        ai_credits: { used: 0, limit: null, next_increase_at: null },
+        automation_runs: {
+          used: 0,
+          limit: Number.MAX_SAFE_INTEGER,
+          resets_at: "2026-02-01T00:00:00.000Z",
+        },
+        domains: {
+          used: [...store.domains.values()].filter((d) => !d.shared).length,
+          limit: limits.domains,
+        },
+        rate_limit: { limit: 600, duration: "1m" },
+        plan,
+        inboxes: { used: 0, limit: plan === "free" ? 1 : null },
+        webhook_endpoints: { used: store.webhooks.size, limit: limits.webhookEndpoints },
         verification: {
           verified: 0,
           from_grant: 0,
@@ -674,8 +716,6 @@ export async function startContractApi(
           cost_cents: 0,
           price_per_1k_cents: 0,
         },
-        team: { id: teamId, name: options.slug ?? "Team" },
-        app_url: options.appBaseUrl ?? null,
       };
     },
 
@@ -982,9 +1022,12 @@ export async function startContractApi(
         id: randomUUID(),
         name: body.name as string,
         alias: (body.alias ?? null) as string | null,
+        from: (body.from ?? null) as string | null,
+        replyTo: asList(body.reply_to),
         subject: (body.subject ?? null) as string | null,
         html: body.html as string,
         text: (body.text ?? null) as string | null,
+        variables: templateVariables(body.variables, at),
         createdAt: at,
         updatedAt: at,
       };
@@ -1003,12 +1046,12 @@ export async function startContractApi(
         created_at: t.createdAt,
         updated_at: t.updatedAt,
         current_version_id: t.id,
-        from: null,
+        from: t.from,
         subject: t.subject,
-        reply_to: null,
+        reply_to: t.replyTo,
         html: t.html,
         text: t.text,
-        variables: [],
+        variables: t.variables,
         has_unpublished_versions: false,
       };
     },
@@ -1034,7 +1077,11 @@ export async function startContractApi(
       ] as const) {
         if (body[wire] !== undefined) (t as Record<string, unknown>)[field] = body[wire];
       }
+      if (body.from !== undefined) t.from = body.from;
+      if (body.reply_to !== undefined) t.replyTo = asList(body.reply_to);
       t.updatedAt = now();
+      if (body.variables !== undefined)
+        t.variables = templateVariables(body.variables, t.updatedAt);
       return { object: "template", id: t.id };
     },
     "DELETE /templates/{id}": ({ params }) => {
@@ -1192,15 +1239,25 @@ export async function startContractApi(
     },
     "POST /suppressions/batch/remove": ({ body }: { body: AnyBody }) => {
       const data: unknown[] = [];
+      const notRemoved: unknown[] = [];
       const ids = new Set<string>(body.ids ?? []);
       const emails = new Set<string>((body.emails ?? []).map((e: string) => e.toLowerCase()));
       for (const s of [...store.suppressions.values()]) {
-        if (ids.has(s.id) || emails.has(s.email)) {
-          store.suppressions.delete(s.id);
-          data.push({ object: "suppression", id: s.id, deleted: true });
+        if (!ids.has(s.id) && !emails.has(s.email)) continue;
+        // A bounce or complaint entry is permanent: it stays and is listed in not_removed.
+        if (s.origin === "bounce" || s.origin === "complaint") {
+          notRemoved.push({
+            object: "suppression",
+            id: s.id,
+            origin: s.origin,
+            reason: "permanent",
+          });
+          continue;
         }
+        store.suppressions.delete(s.id);
+        data.push({ object: "suppression", id: s.id, deleted: true });
       }
-      return { data };
+      return { data, not_removed: notRemoved };
     },
 
     "GET /unsubscribes": ({ url }) =>

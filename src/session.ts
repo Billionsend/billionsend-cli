@@ -9,7 +9,7 @@ import {
 } from "./config.js";
 import type { Context } from "./context.js";
 import { AuthError, createHttp } from "./http.js";
-import { USER_AGENT, VERSION } from "./meta.js";
+import { CLOUD_API_URL, USER_AGENT, VERSION } from "./meta.js";
 import { type ProviderId, RESOURCES, type Resource, type TargetUsage } from "./model.js";
 import type { Progress, StepHandle } from "./progress.js";
 import { type OnProgress, type Provider, providers, type Source } from "./providers/index.js";
@@ -143,9 +143,10 @@ export async function connectTarget(ctx: Context): Promise<TargetSession> {
   });
   const target = createBillionSendTarget(http, ctx.log, baseUrl);
   const usage = await target.probe();
-  ctx.out.write(
-    `${ok(SYM.ok)} BillionSend Cloud ${dim("·")} plan ${capitalize(usage.plan ?? "unknown")}\n`,
-  );
+  // A null plan is the instance's own team, which no plan limits.
+  const where = baseUrl === CLOUD_API_URL ? "" : ` (${baseUrl})`;
+  const plan = usage.plan === null ? "no plan limits" : `plan ${capitalize(usage.plan)}`;
+  ctx.out.write(`${ok(SYM.ok)} BillionSend${where} ${dim("·")} ${plan}\n`);
   return { target, usage, baseUrl };
 }
 

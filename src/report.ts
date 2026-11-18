@@ -1,6 +1,6 @@
-import type { ApplyOutcome, Counts, IdMapping, ResourceCounts } from "./apply.js";
+import type { ApplyOutcome, Counts, DroppedProperty, IdMapping, ResourceCounts } from "./apply.js";
 import type { OutStream } from "./context.js";
-import { CLOUD_BILLING_URL, TRADEMARK_NOTICE } from "./meta.js";
+import { CLOUD_API_URL, CLOUD_BILLING_URL, TRADEMARK_NOTICE } from "./meta.js";
 import {
   type DnsRecord,
   type MigrateState,
@@ -14,16 +14,16 @@ import {
   type TargetUsage,
 } from "./model.js";
 import { type MigratePaths, writePrivate, writePrivateJson } from "./paths.js";
-import { foldedKeysLine, groupPlanItems } from "./plan.js";
+import { foldedKeysLine, groupPlanItems, scopeLine } from "./plan.js";
 import { countUp } from "./progress.js";
 import { bold, dim, err, heading, info, note, SYM, shortId, wrapIndent } from "./theme.js";
 import {
   capitalize,
+  formatDuration,
   formatNumber,
   pluralize,
   retryableStatus,
   stripControlDeep,
-  stripTrailingSlashes,
 } from "./utils.js";
 
 export interface Offer {
@@ -42,9 +42,17 @@ export interface Report {
   source: ProviderId;
   sourceLabel: string;
   target: { baseUrl: string; plan: string | null };
+  /** What --segment limited the run to; null for the whole account. */
+  scope: Plan["scope"];
   counts: Counts;
-  /** Contacts that received at least one property / one topic subscription in the enrichment passes. */
-  enrichment?: { withProperties: number; withTopics: number } | undefined;
+  /** Contacts that received at least one property / one topic subscription in the enrichment passes, and the property values left out. */
+  enrichment?:
+    | {
+        withProperties: number;
+        withTopics: number;
+        droppedProperties?: DroppedProperty[] | undefined;
+      }
+    | undefined;
   /** The source was only read; nothing there was changed. */
   sourceReadOnly: true;
   /** Minted this run. Printed once and part of the --json output; stripped from the files. */
@@ -117,13 +125,10 @@ function buildOffer(
     domains: usage.limits.domains,
     contacts: usage.limits.contacts,
   };
-  const url =
-    usage.appUrl === null
-      ? CLOUD_BILLING_URL
-      : `${stripTrailingSlashes(usage.appUrl)}/settings/billing`;
+  const url = CLOUD_BILLING_URL;
   const short: string[] = [];
   const over = sent !== null && current.perMonth !== null && sent > current.perMonth;
-  const volumeShort = over && !usage.period?.overageEnabled;
+  const volumeShort = over && !usage.overageEnabled;
   if (volumeShort) short.push(`${current.label} allows ${perMonthText(current.perMonth)}`);
   if (current.domains !== null && domains > current.domains) {
     short.push(
@@ -196,9 +201,17 @@ export function buildReport({
     dns.push({ domain: domain.name, records: domain.records });
   }
   const apiKeys = plan.items.filter((i) => i.resource === "api-keys").map((i) => i.key);
-  const manual = plan.manual.filter(
-    (m) => !m.title.startsWith("api-keys/") && !m.detail.startsWith("add DNS records"),
-  );
+  const manual = [
+    ...plan.manual.filter(
+      (m) => !m.title.startsWith("api-keys/") && !m.detail.startsWith("add DNS records"),
+    ),
+    ...outcome.enrichment.droppedProperties
+      .filter((d) => d.contacts > 0)
+      .map((d) => ({
+        title: `properties/${d.key}`,
+        detail: `${pluralize(d.contacts, "contact")} had a value for it that was not written: BillionSend property keys ignore case and \`${d.collidesWith}\` is the same key`,
+      })),
+  ];
   const failures = outcome.state.failures;
   const retryable = failures.filter((f) => retryableStatus(f.statusCode)).length;
   const refused = failures.length - retryable;
@@ -207,7 +220,7 @@ export function buildReport({
     .map(([resource]) => resource);
   const left = [
     ...dns.map((d) => `add DNS records for ${d.domain}`),
-    `set ${plan.source.toUpperCase()}_BASE_URL=${baseUrl} in your app`,
+    baseUrlStep(plan.source, baseUrl),
     ...(apiKeys.length > 0 ? [`create API keys: ${apiKeys.join(", ")}`] : []),
     ...(outcome.ids.length > 0
       ? [`replace ${sourceLabel} topic and segment ids in your code (id map below)`]
@@ -225,6 +238,7 @@ export function buildReport({
     source: plan.source,
     sourceLabel,
     target: { baseUrl, plan: usage.plan },
+    scope: plan.scope,
     counts: outcome.counts,
     enrichment: outcome.enrichment,
     sourceReadOnly: true,
@@ -238,6 +252,20 @@ export function buildReport({
     offer: buildOffer(usage, snapshot, domains, sourceLabel),
     trademark: TRADEMARK_NOTICE,
   };
+}
+
+/**
+ * The cutover step that points the user's app at BillionSend. The source's SDKs
+ * read `<SOURCE>_BASE_URL` for the API address, so the address to put there is
+ * BillionSend's public API, not necessarily the URL this run was given: a
+ * local or proxy `--to-url` is named as what this run used, not as the value.
+ */
+export function baseUrlStep(source: ProviderId, baseUrl: string): string {
+  const name = `${source.toUpperCase()}_BASE_URL`;
+  const step = `set ${name}=${CLOUD_API_URL} in your app, so ${capitalize(source)} SDK calls go to BillionSend`;
+  return baseUrl === CLOUD_API_URL
+    ? step
+    : `${step} (this run used ${baseUrl}; put that address there only if your app reaches BillionSend through it)`;
 }
 
 /** One card per record: type and name, then the whole value on its own line (a DKIM key wraps as a block, never cut). */
@@ -263,7 +291,10 @@ export function cutoverReadyLines(
     heading("Cutover ready"),
     "Everything but the per-contact enrichment is on BillionSend: transactional sending can move now.",
     "Topic opt-outs and properties land in the enrichment passes below; hold topic sends and broadcasts until they finish.",
-    `  ${dim("[")} ${dim("]")} set ${source.toUpperCase()}_BASE_URL=${baseUrl} in your app`,
+    wrapIndent(`${dim("[")} ${dim("]")} ${baseUrlStep(source, baseUrl)}`, {
+      indent: "  ",
+      hanging: "      ",
+    }),
   ];
   for (const [domain, records] of Object.entries(domainRecords)) {
     lines.push("", `DNS records for ${domain}:`, ...dnsCards(records));
@@ -331,10 +362,13 @@ export function countRows(
       if (resource === "enrichment" && enrichment !== undefined) {
         rows.push({ label: "with topic subscriptions", value: enrichment.withTopics });
         rows.push({ label: "with properties", value: enrichment.withProperties });
+        const dropped = (enrichment.droppedProperties ?? []).reduce((n, d) => n + d.contacts, 0);
+        if (dropped > 0) rows.push({ label: "property values not written", value: dropped });
       }
     } else {
       if (c.created > 0) rows.push({ label: `${resource} created`, value: c.created });
       if (c.updated > 0) rows.push({ label: `${resource} updated`, value: c.updated });
+      if (c.matched > 0) rows.push({ label: `${resource} matched existing`, value: c.matched });
       if (c.unchanged > 0) rows.push({ label: `${resource} unchanged`, value: c.unchanged });
     }
     if (c.failed > 0) rows.push({ label: `${resource} failed`, value: c.failed });
@@ -348,12 +382,16 @@ export const SYNC_HINT = (source: ProviderId): string =>
 /** The numbers, the read-only assurance, secrets once, the checklist, the sync hint, then the plan offer. */
 export async function printSummary(out: OutStream, raw: Report): Promise<void> {
   const report = stripControlDeep(raw);
-  const line = (text: string, opts: { indent: string; hanging?: string } = ITEM): void => {
+  const line = (
+    text: string,
+    opts: { indent: string; hanging?: string; keep?: readonly string[] } = ITEM,
+  ): void => {
     out.write(`${wrapIndent(text, opts)}\n`);
   };
   out.write(`\n${heading("Done")}\n\n`);
   await countUp(countRows(report.counts, report.enrichment), { stream: out });
   out.write(`\n${dim(`${report.sourceLabel} was only read; nothing there was changed.`)}\n`);
+  if (report.scope !== null) out.write(`${dim(wrapIndent(scopeLine(report.scope)))}\n`);
   if (report.freshWebhookSecrets.length > 0) {
     out.write("\nWebhook signing secrets, shown once (they are not saved anywhere):\n");
     for (const { endpoint, secret } of report.freshWebhookSecrets) {
@@ -381,7 +419,10 @@ export async function printSummary(out: OutStream, raw: Report): Promise<void> {
   }
   if (report.failures.length > 0) {
     out.write("\nFailed:\n");
-    for (const f of report.failures) line(`${err(SYM.err)} ${f.resource}/${f.key} — ${f.message}`);
+    for (const f of report.failures) {
+      // An address stays in one piece: only the words around it wrap.
+      line(`${err(SYM.err)} ${f.resource}/${f.key} — ${f.message}`, { ...ITEM, keep: [f.key] });
+    }
   }
   out.write(`\n${dim(wrapIndent(SYNC_HINT(report.source)))}\n`);
   if (report.offer !== null)
@@ -397,13 +438,16 @@ export function renderReportMd(raw: Report): string {
     "",
     "## Numbers",
     "",
-    "| Resource | Created | Updated | Unchanged | Skipped | Manual | Failed |",
-    "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    "| Resource | Created | Updated | Matched existing | Unchanged | Skipped | Manual | Failed |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ...orderedCounts(report.counts).map(
       ([resource, c]) =>
-        `| ${resource} | ${c.created} | ${c.updated} | ${c.unchanged} | ${c.skipped} | ${c.manual} | ${c.failed} |`,
+        `| ${resource} | ${c.created} | ${c.updated} | ${c.matched} | ${c.unchanged} | ${c.skipped} | ${c.manual} | ${c.failed} |`,
     ),
     "",
+    "Matched existing: contacts the batch endpoint found already in your account. It does not say whether a matched contact changed, so these are not counted as updated or unchanged.",
+    "",
+    ...(report.scope === null ? [] : [scopeLine(report.scope), ""]),
     `${report.sourceLabel} was only read; nothing there was changed.`,
     "",
     "## Checklist",
@@ -466,3 +510,49 @@ export function writeReport(paths: MigratePaths, report: Report, extraMd: string
   writePrivate(paths.reportMd, md);
   if (extraMd !== null) writePrivate(extraMd, md);
 }
+
+/** The Markdown of `migrate plan --report`: what a run would do, nothing that has happened. */
+export function renderPlanMd(raw: Plan, sourceLabel: string): string {
+  const plan = stripControlDeep(raw);
+  const rows = RESOURCES.flatMap((resource) => {
+    const own = plan.items.filter((i) => i.resource === resource);
+    if (own.length === 0) return [];
+    const n = (action: PlanItem["action"]): number =>
+      own.filter((i) => i.action === action).reduce((sum, i) => sum + (i.count ?? 1), 0);
+    return [
+      `| ${resource} | ${n("create")} | ${n("update")} | ${n("unchanged")} | ${n("manual")} | ${n("skip")} |`,
+    ];
+  });
+  const lines = [
+    `# Migration plan — ${sourceLabel} → BillionSend`,
+    "",
+    `Planned ${plan.createdAt} · target ${plan.target.baseUrl}${plan.target.plan === null ? "" : ` · plan ${capitalize(plan.target.plan)}`}`,
+    "",
+    "Nothing has been written: this is what `billionsend migrate apply` would do.",
+    "",
+    ...(plan.scope === null ? [] : [scopeLine(plan.scope), ""]),
+    "## Plan",
+    "",
+    "| Resource | Create | Update | Unchanged | Manual | Skipped |",
+    "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ...rows,
+    "",
+    `About ${formatNumber(plan.estimate.requests)} requests (${formatDuration(plan.estimate.seconds)} at ${plan.rps} req/s).`,
+  ];
+  if (plan.warnings.length > 0) {
+    lines.push("", "## Warnings", "", ...plan.warnings.map((w) => `- ${w}`));
+  }
+  if (plan.manual.length > 0) {
+    lines.push(
+      "",
+      "## Manual notes",
+      "",
+      ...plan.manual.map(({ title, detail }) => `- ${title} — ${detail}`),
+    );
+  }
+  lines.push("", "---", "", TRADEMARK_NOTICE, "");
+  return lines.join("\n");
+}
+
+export const writePlanReport = (path: string, plan: Plan, sourceLabel: string): void =>
+  writePrivate(path, renderPlanMd(plan, sourceLabel));

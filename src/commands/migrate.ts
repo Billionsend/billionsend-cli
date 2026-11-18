@@ -150,7 +150,11 @@ async function resolveDomainLimit(ctx: Context, plan: Plan, target: TargetState)
 }
 
 /** Steps 1-5: header, connect both sides, read, choose resources, plan. */
-export async function prepare(ctx: Context, providerId: ProviderId): Promise<Prepared> {
+export async function prepare(
+  ctx: Context,
+  providerId: ProviderId,
+  { pick = true }: { pick?: boolean } = {},
+): Promise<Prepared> {
   const { config, out } = ctx;
   const label = providers[providerId].label;
   printHeader(
@@ -165,6 +169,7 @@ export async function prepare(ctx: Context, providerId: ProviderId): Promise<Pre
   const snapshot = await source.readShallow({
     include,
     includeSent: config.includeSent,
+    segments: config.segment,
     onProgress: bridgeProgress(ctx.progress),
   });
   snapshot.metrics = await source.readMetrics();
@@ -172,7 +177,7 @@ export async function prepare(ctx: Context, providerId: ProviderId): Promise<Pre
   const targetState = await target.readState();
   step.done("current state read");
   const chosen =
-    config.nonInteractive || config.only !== null || config.skip.length > 0
+    !pick || config.nonInteractive || config.only !== null || config.skip.length > 0
       ? include
       : await pickResources(ctx, snapshot, include);
   let plan = buildPlan({
@@ -180,6 +185,11 @@ export async function prepare(ctx: Context, providerId: ProviderId): Promise<Pre
     target: targetState,
     options: {
       include: chosen,
+      // What the picker left selected is recorded as `only`, so a plan file reproduces it.
+      only: chosen.size === include.size ? config.only : RESOURCES.filter((r) => chosen.has(r)),
+      skip: config.skip,
+      segment: config.segment,
+      onConflict: config.onConflict,
       includeSent: config.includeSent,
       freshWebhookSecrets: config.freshWebhookSecrets,
       rps: config.rps,
@@ -196,7 +206,7 @@ export async function prepare(ctx: Context, providerId: ProviderId): Promise<Pre
 /** Manual items are listed, not counted: a converged migration must exit 0 even with API keys to recreate. */
 export const hasChanges = (plan: Plan): boolean => plan.counts.create + plan.counts.update > 0;
 
-function newState(baseUrl: string, hash: string): MigrateState {
+export function newState(baseUrl: string, hash: string): MigrateState {
   const now = new Date().toISOString();
   return {
     version: 1,
@@ -231,12 +241,13 @@ function loadState(ctx: Context, baseUrl: string, hash: string): MigrateState {
 }
 
 /** What applyPlan tallies for a plan with nothing to write: unchanged, manual and skipped items. */
-function idleOutcome(plan: Plan, state: MigrateState): ApplyOutcome {
+export function idleOutcome(plan: Plan, state: MigrateState): ApplyOutcome {
   const counts: Counts = {};
   for (const item of plan.items) {
     const c = counts[item.resource] ?? {
       created: 0,
       updated: 0,
+      matched: 0,
       unchanged: 0,
       skipped: 0,
       manual: 0,
@@ -253,11 +264,11 @@ function idleOutcome(plan: Plan, state: MigrateState): ApplyOutcome {
     freshSecrets: [],
     domainRecords: {},
     ids: [],
-    enrichment: { withProperties: 0, withTopics: 0 },
+    enrichment: { withProperties: 0, withTopics: 0, droppedProperties: [] },
   };
 }
 
-const runReport = (prepared: Prepared, outcome: ApplyOutcome): Report =>
+export const runReport = (prepared: Prepared, outcome: ApplyOutcome): Report =>
   buildReport({
     plan: prepared.plan,
     snapshot: prepared.snapshot,

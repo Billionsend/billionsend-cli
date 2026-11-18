@@ -38,7 +38,7 @@ export async function status(ctx: Context): Promise<number> {
         bold(formatNumber(ids.length)),
       ]),
     );
-  const { contactsCursor, enrichmentDone } = state.progress;
+  const { contactsCursor, enrichmentDone, pendingEnrichment } = state.progress;
   out.write("\nProgress\n");
   block([
     ["  Contacts", contactsCursor ? `resumes after ${contactsCursor}` : "complete"],
@@ -46,6 +46,14 @@ export async function status(ctx: Context): Promise<number> {
       "  Enriched",
       enrichmentDone ? `resumes with ${formatNumber(enrichmentDone.length)} done` : "complete",
     ],
+    ...(pendingEnrichment && pendingEnrichment.length > 0
+      ? [
+          [
+            "  Waiting",
+            `${pluralize(pendingEnrichment.length, "contact")} not enriched yet`,
+          ] as const,
+        ]
+      : []),
   ]);
   if (state.failures.length > 0) {
     out.write(`\n${pluralize(state.failures.length, "failure")} in the last run\n`);

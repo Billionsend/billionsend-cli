@@ -24,6 +24,7 @@ const report: Report = {
   source: "resend",
   sourceLabel: "Resend",
   target: { baseUrl: "https://api.billionsend.com", plan: "free" },
+  scope: null,
   counts: {},
   sourceReadOnly: true,
   freshWebhookSecrets: [],
@@ -82,8 +83,24 @@ const manual = [
 const full: Report = {
   ...report,
   counts: {
-    contacts: { created: 721, updated: 0, unchanged: 0, skipped: 0, manual: 0, failed: 0 },
-    templates: { created: 0, updated: 0, unchanged: 0, skipped: 0, manual: 0, failed: 0 },
+    contacts: {
+      created: 721,
+      updated: 0,
+      matched: 0,
+      unchanged: 0,
+      skipped: 0,
+      manual: 0,
+      failed: 0,
+    },
+    templates: {
+      created: 0,
+      updated: 0,
+      matched: 0,
+      unchanged: 0,
+      skipped: 0,
+      manual: 0,
+      failed: 0,
+    },
   },
   freshWebhookSecrets: [{ endpoint: "https://hook.example", secret: "whsec_abc" }],
   checklist: { done: ["contacts", "topics"], left: ["add DNS records for news.example.com"] },
@@ -122,6 +139,66 @@ const full: Report = {
 
 describe("printSummary layout", () => {
   afterEach(() => setColorMode("auto"));
+
+  it("lists a failure once, its address whole even when the address holds a space", async () => {
+    setColorMode("never");
+    const key = "mary jane@example.com";
+    const text = await summary({
+      ...report,
+      checklist: { done: [], left: [] },
+      failures: [
+        {
+          resource: "contacts",
+          key,
+          message: "Invalid email address: contains a space and is much too long to share a line",
+          statusCode: 422,
+        },
+      ],
+    });
+    const lines = text.split("\n");
+    expect(lines.filter((l) => l.includes(key))).toHaveLength(1);
+    expect(lines.some((l) => l.startsWith("  ✗ contacts/mary jane@example.com — "))).toBe(true);
+  });
+
+  it("counts matched contacts and the property values that were not written", async () => {
+    setColorMode("never");
+    const text = await summary({
+      ...full,
+      counts: {
+        contacts: {
+          created: 0,
+          updated: 0,
+          matched: 6931,
+          unchanged: 0,
+          skipped: 0,
+          manual: 0,
+          failed: 0,
+        },
+        enrichment: {
+          created: 0,
+          updated: 6931,
+          matched: 0,
+          unchanged: 0,
+          skipped: 0,
+          manual: 0,
+          failed: 0,
+        },
+      },
+      enrichment: {
+        withProperties: 6000,
+        withTopics: 6931,
+        droppedProperties: [{ key: "PLAN", collidesWith: "plan", contacts: 12 }],
+      },
+      scope: { segments: [{ id: "s1", name: "BillionVerify" }] },
+    });
+    expect(text).toContain("6,931  contacts matched existing\n");
+    expect(text).not.toContain("contacts updated");
+    expect(text).toContain("12  property values not written\n");
+    expect(text).toContain("Scope (--segment): only BillionVerify and its members");
+    expect(
+      renderReportMd({ ...full, scope: { segments: [{ id: "s1", name: "BillionVerify" }] } }),
+    ).toContain("Matched existing");
+  });
 
   it("is plain text with the Done heading, cards and vertical id rows when piped", async () => {
     setColorMode("never");
@@ -212,7 +289,13 @@ describe("buildReport checklist", () => {
     buildReport({
       plan: { source: "resend", items: [], manual: [] } as never,
       snapshot: {} as never,
-      outcome: { state: { failures }, counts: {}, domainRecords: {}, ids: [] } as never,
+      outcome: {
+        state: { failures },
+        counts: {},
+        domainRecords: {},
+        ids: [],
+        enrichment: { withProperties: 0, withTopics: 0, droppedProperties: [] },
+      } as never,
       usage: { plan: null } as never,
       targetState: { domains: [] } as never,
       baseUrl: "https://api.billionsend.com",
@@ -224,7 +307,8 @@ describe("buildReport checklist", () => {
     message: `answered ${statusCode}`,
     statusCode,
   });
-  const baseUrlStep = "set RESEND_BASE_URL=https://api.billionsend.com in your app";
+  const baseUrlStep =
+    "set RESEND_BASE_URL=https://api.billionsend.com in your app, so Resend SDK calls go to BillionSend";
 
   it("suggests a retry only for failures a re-run could clear; refusals get their own step", () => {
     // A failure from a state file or instance older than per-row status codes.

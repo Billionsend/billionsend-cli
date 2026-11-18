@@ -43,6 +43,8 @@ export interface ReadShallowOptions {
   include: ReadonlySet<Resource>;
   /** Fetch the bodies of sent broadcasts too (they are always listed). */
   includeSent?: boolean | undefined;
+  /** Names or ids of the segments to read; segments and contacts are limited to them. Empty or omitted = everything. */
+  segments?: readonly string[] | undefined;
   onProgress?: OnProgress | undefined;
 }
 
@@ -302,7 +304,46 @@ const emptySnapshot = (): Snapshot => ({
   suppressions: [],
   metrics: { emailsLast30Days: null },
   enriched: false,
+  segmentScope: null,
 });
+
+/** The names and ids a wrong --segment is answered with: enough to pick from, not a page of them. */
+const SEGMENT_HINT_MAX = 30;
+
+/**
+ * Each selector is a segment id, else a segment name (exact, then ignoring
+ * case). A name matching several segments selects all of them. Anything that
+ * matches nothing is an error that lists what is there.
+ */
+export function selectSegments<T extends { id: string; name: string }>(
+  all: readonly T[],
+  selectors: readonly string[],
+): T[] {
+  const picked: T[] = [];
+  const missing: string[] = [];
+  for (const selector of selectors) {
+    const lower = selector.toLowerCase();
+    const matches = [
+      all.filter((s) => s.id === selector),
+      all.filter((s) => s.name === selector),
+      all.filter((s) => s.name.toLowerCase() === lower),
+    ].find((found) => found.length > 0);
+    if (matches === undefined) missing.push(selector);
+    else for (const match of matches) if (!picked.includes(match)) picked.push(match);
+  }
+  if (missing.length > 0) {
+    const shown = all.slice(0, SEGMENT_HINT_MAX).map((s) => `  ${s.name}  (${s.id})`);
+    const more = all.length - shown.length;
+    throw new Error(
+      `No Resend segment named or with the id ${missing.map((m) => `\`${m}\``).join(", ")}. ${
+        all.length === 0
+          ? "The account has no segments."
+          : `Segments on the account:\n${shown.join("\n")}${more > 0 ? `\n  … and ${more} more` : ""}`
+      }`,
+    );
+  }
+  return picked;
+}
 
 /** Reads a Resend account into the neutral Snapshot. GET only; `http` must be the read-only client. */
 export function createResendSource(http: Http, log: Logger): Source {
@@ -355,6 +396,29 @@ export function createResendSource(http: Http, log: Logger): Source {
     return out;
   }
 
+  /** The segments' details and member addresses; `scope` null = every segment on the account. */
+  async function readSegments(
+    scope: readonly WireSegment[] | null,
+    onProgress: OnProgress | undefined,
+    membersOf: (id: string) => Promise<WireContact[]>,
+  ): Promise<SourceSegment[]> {
+    const list = scope ?? (await listAll<WireSegment>("/segments"));
+    const out: SourceSegment[] = [];
+    for (const item of list) {
+      const { body } = await get<WireSegment>(path("segments", item.id));
+      const members = await membersOf(item.id);
+      out.push({
+        id: item.id,
+        name: body.name ?? item.name,
+        filter: body.filter ?? null,
+        memberEmails: members.map((member) => member.email),
+      });
+      onProgress?.({ label: "Segments", n: out.length, total: list.length, done: false });
+    }
+    onProgress?.({ label: "Segments", n: out.length, total: list.length, done: true });
+    return out;
+  }
+
   return {
     get requests() {
       return requests;
@@ -366,8 +430,25 @@ export function createResendSource(http: Http, log: Logger): Source {
       return first === undefined ? { ok: true } : { ok: true, teamHint: first.name };
     },
 
-    async readShallow({ include, includeSent = false, onProgress }) {
+    async readShallow({ include, includeSent = false, segments = [], onProgress }) {
       const snapshot = emptySnapshot();
+      const needsContacts = include.has("contacts") || include.has("enrichment");
+      // --segment: the chosen segments, read first so a wrong name stops the run before anything else is read.
+      const scope =
+        segments.length === 0
+          ? null
+          : selectSegments(await listAll<WireSegment>("/segments"), segments);
+      if (scope !== null) snapshot.segmentScope = scope.map(({ id, name }) => ({ id, name }));
+      // GET /contacts ignores segment_id on Resend (the full list comes back
+      // for every segment); membership lives on the segment's own list.
+      const memberLists = new Map<string, WireContact[]>();
+      const membersOf = async (id: string): Promise<WireContact[]> => {
+        const cached = memberLists.get(id);
+        if (cached !== undefined) return cached;
+        const members = await listAll<WireContact>(`/segments/${id}/contacts`, {});
+        memberLists.set(id, members);
+        return members;
+      };
       if (include.has("domains")) {
         snapshot.domains = await listWithDetails<WireDomain, SourceDomain>(
           "/domains",
@@ -400,28 +481,30 @@ export function createResendSource(http: Http, log: Logger): Source {
           visibility: topic.visibility,
         }));
       }
-      if (include.has("segments")) {
-        snapshot.segments = await listWithDetails<WireSegment, SourceSegment>(
-          "/segments",
-          "Segments",
-          onProgress,
-          async (item) => {
-            const { body } = await get<WireSegment>(path("segments", item.id));
-            // GET /contacts ignores segment_id on Resend (the full list comes back
-            // for every segment); membership lives on the segment's own list.
-            const members = await listAll<WireContact>(`/segments/${item.id}/contacts`, {});
-            return {
-              id: item.id,
-              name: body.name ?? item.name,
-              filter: body.filter ?? null,
-              memberEmails: members.map((member) => member.email),
-            };
-          },
+      if (include.has("segments") || (scope !== null && needsContacts)) {
+        snapshot.segments = await readSegments(
+          scope,
+          include.has("segments") ? onProgress : undefined,
+          membersOf,
         );
       }
-      if (include.has("contacts") || include.has("enrichment")) {
-        const list = await listAll<WireContact>("/contacts", {}, "Contacts", onProgress);
-        snapshot.contacts = list.map(toContact);
+      if (needsContacts) {
+        if (scope === null) {
+          const list = await listAll<WireContact>("/contacts", {}, "Contacts", onProgress);
+          snapshot.contacts = list.map(toContact);
+        } else {
+          const seen = new Set<string>();
+          const members: WireContact[] = [];
+          for (const segment of scope) {
+            for (const member of await membersOf(segment.id)) {
+              if (seen.has(member.id)) continue;
+              seen.add(member.id);
+              members.push(member);
+            }
+          }
+          onProgress?.({ label: "Contacts", n: members.length, total: members.length, done: true });
+          snapshot.contacts = members.map(toContact);
+        }
       }
       if (include.has("broadcasts")) {
         snapshot.broadcasts = await listWithDetails<WireBroadcast, SourceBroadcast>(
@@ -561,7 +644,7 @@ export function estimateSourceRequests(snapshot: Snapshot): {
     pagesOf(s.topics.length) +
     pagesOf(s.segments.length) +
     s.segments.reduce((sum, segment) => sum + 1 + pagesOf(segment.memberEmails.length), 0) +
-    pagesOf(s.contacts.length) +
+    (s.segmentScope === null ? pagesOf(s.contacts.length) : 0) +
     pagesOf(s.broadcasts.length) +
     s.broadcasts.filter((b) => b.status !== "sent" || b.html !== null || b.text !== null).length +
     pagesOf(s.templates.length) +
