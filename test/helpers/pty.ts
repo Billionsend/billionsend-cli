@@ -59,9 +59,9 @@ export function runOnTerminal(
   });
 }
 
-/** The program's output as the terminal would show it for the text: escape sequences taken out. */
-export const plain = (output: string): string =>
+const ESCAPES =
   // biome-ignore lint/suspicious/noControlCharactersInRegex: the control bytes are the target
-  output
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
-    .replace(/\r/g, "");
+  /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+
+/** The program's output as the terminal would show it for the text: escape sequences taken out. */
+export const plain = (output: string): string => output.replace(ESCAPES, "").replace(/\r/g, "");

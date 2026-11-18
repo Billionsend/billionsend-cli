@@ -17,7 +17,6 @@ import { cliRunner, readReportIn } from "./helpers/run-cli.js";
  * shows, how rollback and apply refuse, and how a plan file and a state file are held to the run.
  */
 
-const SLOW = 120_000;
 const UUID = "00000000-0000-4000-8000-0000000000aa";
 
 let fake: FakeResend;

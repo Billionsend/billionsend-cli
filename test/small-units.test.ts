@@ -128,7 +128,12 @@ describe("progress on a terminal", () => {
     vi.useFakeTimers();
     try {
       const chunks: string[] = [];
-      const stream = { write: (c: string) => (chunks.push(String(c)), true) } as never;
+      const stream = {
+        write: (c: string) => {
+          chunks.push(String(c));
+          return true;
+        },
+      } as never;
       const progress = createProgress({ stream, tty: true });
       progress.section(["Contacts"]);
       const step = progress.step("Contacts");
