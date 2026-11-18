@@ -9,6 +9,31 @@ const env = {
 };
 
 describe("parseConfig", () => {
+  it("an API key with a line break or spaces around it is the key without them, from the environment and from a flag", () => {
+    const config = parseConfig(
+      ["migrate", "--from", "resend"],
+      { ...env, RESEND_API_KEY: "  re_x\n", BILLIONSEND_API_KEY: "\tbs_y \r\n" },
+      true,
+    );
+    expect(config.fromKey).toEqual({ source: "env", value: "re_x" });
+    expect(config.toKey).toEqual({ source: "env", value: "bs_y" });
+    const flagged = parseConfig(
+      ["migrate", "--from", "resend", "--from-key", " re_flag \n"],
+      { BILLIONSEND_API_KEY: "bs_y" },
+      true,
+    );
+    expect(flagged.fromKey).toEqual({ source: "flag", value: "re_flag" });
+  });
+
+  it("a key variable holding only whitespace is unset, so the key is asked for", () => {
+    const config = parseConfig(
+      ["migrate", "--from", "resend"],
+      { ...env, RESEND_API_KEY: " \n" },
+      true,
+    );
+    expect(config.fromKey).toEqual({ source: "prompt", value: null });
+  });
+
   it("resolves the interactive default command with env-provided credentials", () => {
     const config = parseConfig(["migrate", "--from", "resend"], env, true);
     expect(config).toMatchObject({

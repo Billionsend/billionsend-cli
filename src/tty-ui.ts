@@ -1,5 +1,5 @@
 import { createInterface, emitKeypressEvents } from "node:readline";
-import { bold, bone, dim, info, wrapIndent } from "./theme.js";
+import { bone, dim, wrapIndent } from "./theme.js";
 import { stripControl, truncate } from "./utils.js";
 
 /** Structural subset of lineReader — the non-TTY fallback asker every prompt degrades to. */
@@ -257,20 +257,6 @@ export function banner(tier: "full" | "compact" = "full"): string[] {
   return bannerLines(tier);
 }
 
-/** Greedy word wrap; single words longer than width stay unbroken. */
-export function wrapText(text: string, width: number): string {
-  const lines: string[] = [];
-  for (const word of text.split(/\s+/)) {
-    const last = lines[lines.length - 1];
-    if (last !== undefined && `${last} ${word}`.length <= width) {
-      lines[lines.length - 1] = `${last} ${word}`;
-    } else {
-      lines.push(word);
-    }
-  }
-  return lines.join("\n");
-}
-
 export interface SelectOption {
   value: string;
   label: string;
@@ -282,25 +268,18 @@ export interface SelectOption {
  * `label [initial]: ` question via `rl` so piped input behaves exactly like
  * the free-form prompt it replaces (typed value, or the initial on empty/EOF).
  * `initial` may be a value outside `options` — pipes accept it verbatim, the
- * TTY cursor just starts at the first option. `rail` draws the guided-flow
- * style (a diamond before the label, rows on the rail, the answer redrawn
- * under a hollow diamond) instead of the bare list.
+ * TTY cursor just starts at the first option.
  */
 export async function selectPrompt(
   rl: Asker,
-  {
-    label,
-    options,
-    initial,
-    rail = false,
-  }: { label: string; options: SelectOption[]; initial?: string; rail?: boolean },
+  { label, options, initial }: { label: string; options: SelectOption[]; initial?: string },
 ): Promise<string> {
   const fallback = initial ?? options[0]?.value ?? "";
   if (!isInteractive()) {
     const answer = (await rl.question(`${label} [${fallback}]: `)).trim();
     return answer || fallback;
   }
-  return selectTty(label, options, fallback, rail);
+  return selectTty(label, options, fallback);
 }
 
 interface Key {
@@ -384,28 +363,7 @@ export function optionRow(
   return `${(selected ? bone : dim)(`${prefix}${head}`)}${tail ? dim(tail) : ""}`;
 }
 
-/**
- * One option row on the rail: `│  ● label  hint` for the highlighted row,
- * `│  ○ label  hint` dim for the rest. Styled per part, so no SGR run nests
- * inside another; cut to `columns - 1` so it never wraps.
- */
-export function railOptionRow(
-  { label, hint }: SelectOption,
-  selected: boolean,
-  columns: number,
-): string {
-  const text = truncate(`${label}${hint ? `  ${hint}` : ""}`, columns - 6);
-  const head = text.slice(0, label.length);
-  const tail = text.slice(label.length);
-  return `${dim("│")}  ${selected ? info("●") : dim("○")} ${selected ? bone(head) : dim(head)}${dim(tail)}`;
-}
-
-async function selectTty(
-  label: string,
-  options: SelectOption[],
-  initial: string,
-  rail = false,
-): Promise<string> {
+async function selectTty(label: string, options: SelectOption[], initial: string): Promise<string> {
   const { stdout } = process;
   let index = Math.max(
     0,
@@ -415,16 +373,10 @@ async function selectTty(
   const render = (first: boolean): void => {
     if (!first) eraseRows(height);
     const columns = terminalColumns();
-    const lines = rail
-      ? [
-          `${info("◆")}  ${bold(label)}`,
-          ...options.map((o, i) => railOptionRow(o, i === index, columns)),
-          dim("│"),
-        ]
-      : [
-          label,
-          ...options.map((o, i) => optionRow(i === index ? "❯ " : "  ", o, i === index, columns)),
-        ];
+    const lines = [
+      label,
+      ...options.map((o, i) => optionRow(i === index ? "❯ " : "  ", o, i === index, columns)),
+    ];
     height = rowsFor(lines, columns);
     stdout.write(`${lines.join("\n")}\n`);
   };
@@ -446,11 +398,7 @@ async function selectTty(
     () => eraseRows(height),
   );
   const chosen = options.find((o) => o.value === value)?.label ?? value;
-  stdout.write(
-    rail
-      ? `${dim("◇")}  ${label}\n${dim("│")}  ${dim(chosen)}\n${dim("│")}\n`
-      : `${answerLine(label, chosen)}\n`,
-  );
+  stdout.write(`${answerLine(label, chosen)}\n`);
   return value;
 }
 
@@ -542,15 +490,11 @@ export function maskSecret(secret: string): string {
 /**
  * Secret entry without echo when stdin is a terminal (backspace edits, enter
  * confirms); the masked value is printed afterwards so the transcript shows
- * which key was used. With stdin piped, a plain `label: ` question. `rail`
- * draws the input on the guided-flow rail under a head the caller printed.
+ * which key was used. With stdin piped, a plain `label: ` question.
  * A line pasted before the prompt appeared is this prompt's answer, as it
  * would be for any other question, and is never printed in clear.
  */
-export async function secretPrompt(
-  rl: Asker,
-  { label, rail = false }: { label: string; rail?: boolean },
-): Promise<string> {
+export async function secretPrompt(rl: Asker, { label }: { label: string }): Promise<string> {
   const mode = secretPromptMode(process.stdin.isTTY === true, process.stdout.isTTY === true);
   if (!mode.masked) return (await rl.question(`${label}: `)).trim();
   const stdout = mode.toStderr ? process.stderr : process.stdout;
@@ -559,7 +503,7 @@ export async function secretPrompt(
   if (ahead !== undefined) {
     secret = ahead.trim();
   } else {
-    stdout.write(rail ? `${dim("│")}  ` : `${label}: `);
+    stdout.write(`${label}: `);
     let value = "";
     secret = await readKeys<string>(
       (str, key) => {
@@ -572,11 +516,7 @@ export async function secretPrompt(
       stdout,
     );
   }
-  stdout.write(
-    rail
-      ? `${dim("│")}  ${dim(maskSecret(secret))}\n${dim("│")}\n`
-      : `${label}: ${dim(maskSecret(secret))}\n`,
-  );
+  stdout.write(`${label}: ${dim(maskSecret(secret))}\n`);
   return secret;
 }
 
@@ -590,27 +530,4 @@ export async function confirmPrompt(
     .toLowerCase();
   if (answer === "") return initial;
   return answer === "y" || answer === "yes";
-}
-
-/**
- * Free-form line; empty takes `initial`. `validate` returns an error message
- * to re-ask on a terminal — on a pipe there is nobody to re-ask, so the
- * message is thrown for the caller to turn into exit 1.
- */
-export async function textPrompt(
-  rl: Asker,
-  {
-    label,
-    initial,
-    validate,
-  }: { label: string; initial?: string; validate?: (value: string) => string | undefined },
-): Promise<string> {
-  for (;;) {
-    const answer = (await rl.question(`${label}${initial ? ` [${initial}]` : ""}: `)).trim();
-    const value = answer || initial || "";
-    const error = validate?.(value);
-    if (error === undefined) return value;
-    if (!isInteractive()) throw new Error(`${label}: ${error}`);
-    process.stdout.write(`${error}\n`);
-  }
 }

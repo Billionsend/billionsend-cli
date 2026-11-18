@@ -27,7 +27,7 @@ function collector() {
 export function cliRunner(fake: FakeResend, api: ContractApi, dir: string) {
   return async function run(
     argv: string[],
-    options: { env?: Record<string, string>; stdin?: string } = {},
+    options: { env?: Record<string, string>; stdin?: string; fetch?: typeof fetch } = {},
   ) {
     const input = new PassThrough();
     input.end(options.stdin ?? "");
@@ -45,6 +45,7 @@ export function cliRunner(fake: FakeResend, api: ContractApi, dir: string) {
         ...options.env,
       },
       cwd: dir,
+      ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
     });
     return { code, stdout: stdout.text, stderr: stderr.text };
   };

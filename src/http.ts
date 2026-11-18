@@ -15,11 +15,24 @@ export class AuthError extends Error {
 export class ApiError extends Error {
   readonly status: number;
   readonly body: unknown;
-  constructor(status: number, name: string, message: string, body: unknown = null) {
+  /**
+   * The request was sent once and not again because it may have written something (a POST or
+   * PATCH that failed with a 5xx, a timeout or a lost connection). The caller records it as a
+   * failure; a re-run picks it up.
+   */
+  readonly sentOnce: boolean;
+  constructor(
+    status: number,
+    name: string,
+    message: string,
+    body: unknown = null,
+    sentOnce = false,
+  ) {
     super(message);
     this.name = name;
     this.status = status;
     this.body = body;
+    this.sentOnce = sentOnce;
   }
 }
 
@@ -100,6 +113,42 @@ export function cursorGuard(
   };
 }
 
+/**
+ * A path from a template: every value goes in as one encoded segment (`a/b` or `a b` cannot add a
+ * segment or leave the route). `http` refuses an empty, `.` or `..` segment before sending.
+ */
+export const route = (strings: TemplateStringsArray, ...values: string[]): string =>
+  strings.reduce(
+    (out, text, i) => out + text + (i < values.length ? encodeURIComponent(values[i] ?? "") : ""),
+    "",
+  );
+
+/** The request path's segments that would send the request somewhere else than named: empty, `.` or `..`. */
+function badSegment(pathname: string): string | null {
+  for (const segment of pathname.split("/").slice(1)) {
+    let decoded = segment;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      // Left as it is: the server will refuse a malformed escape on its own.
+    }
+    if (decoded === "" || decoded === "." || decoded === "..")
+      return decoded === "" ? "an empty one" : `\`${decoded}\``;
+  }
+  return null;
+}
+
+/** Header values are visible ASCII, space and tab; anything else cannot be sent as a header. */
+const HEADER_VALUE = /^[\t\x20-\x7e]*$/;
+
+/** A request that was not sent because of what it holds; says where, never what (a header may be the API key). */
+export class RequestError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "invalid_request";
+  }
+}
+
 export interface HttpResponse<T = unknown> {
   status: number;
   body: T;
@@ -109,6 +158,11 @@ export interface HttpResponse<T = unknown> {
 export interface RequestOptions {
   query?: Record<string, string | number | boolean | undefined> | undefined;
   headers?: Record<string, string> | undefined;
+  /**
+   * A POST that only reads, or that repeats harmlessly: it may be retried after a 5xx, a
+   * timeout or a lost connection like a GET. Without it a POST or PATCH is sent once.
+   */
+  idempotent?: boolean | undefined;
 }
 
 export interface Http {
@@ -143,7 +197,7 @@ export interface HttpOptions {
    * halves the effective rate, which climbs back one req/s per clean second.
    */
   rps: number;
-  /** Attempts for 5xx and network failures (backoff 1s, 2s, 4s, 8s). */
+  /** Attempts for 5xx and network failures of a request that may be repeated (backoff 1s, 2s, 4s, 8s). */
   maxAttempts?: number | undefined;
   /** Attempts for 429 (wait per retry-after / ratelimit-reset, 2s without either). */
   rateLimitAttempts?: number | undefined;
@@ -157,6 +211,15 @@ export interface HttpOptions {
 }
 
 const MAX_WAIT_MS = 120_000;
+/** A 429 that asks for more than this is an error, not a wait. */
+const MAX_RETRY_AFTER_MS = 60_000;
+/**
+ * Methods that may be sent again after a 5xx, a timeout or a lost connection, because the first try
+ * writing something changes nothing the second would not. A POST or PATCH may have written, so it
+ * is sent once and a failure is recorded; a re-run picks up where it stopped. (A 429 is different:
+ * the API refuses it before it writes anything, so every method waits and retries.)
+ */
+const REPEATABLE_METHODS: ReadonlySet<string> = new Set(["GET", "HEAD", "PUT", "DELETE"]);
 /**
  * Requests left in the window at which acquire() waits for the reset. The
  * window is the team's, shared with its production sending, so the last
@@ -275,12 +338,19 @@ export function createHttp(options: HttpOptions): HttpClient {
     method: string,
     path: string,
     body: unknown,
-    { query, headers: extraHeaders }: RequestOptions = {},
+    { query, headers: extraHeaders, idempotent = false }: RequestOptions = {},
   ): Promise<HttpResponse<T>> {
     if (options.readOnly === true && method !== "GET") {
       throw new Error(`${name} is read-only for this tool; refusing ${method} ${path}`);
     }
-    const url = new URL(base + (path.startsWith("/") ? path : `/${path}`));
+    const rawPath = path.startsWith("/") ? path : `/${path}`;
+    const bad = badSegment(rawPath.split("?")[0] ?? rawPath);
+    if (bad !== null) {
+      throw new RequestError(
+        `${name}: ${method} ${rawPath.split("?")[0]} has ${bad} as a path segment; an id is missing or not an id`,
+      );
+    }
+    const url = new URL(base + rawPath);
     for (const [key, value] of Object.entries(query ?? {})) {
       if (value !== undefined) url.searchParams.set(key, String(value));
     }
@@ -292,12 +362,20 @@ export function createHttp(options: HttpOptions): HttpClient {
       ...(body === undefined ? {} : { "content-type": "application/json" }),
       ...extraHeaders,
     };
+    for (const [header, value] of Object.entries(headers)) {
+      if (!HEADER_VALUE.test(value)) {
+        throw new RequestError(
+          `${name}: the ${header} header holds a character a header cannot carry (only printable ASCII is allowed)${header === "authorization" ? "; check the API key for a stray line break or non-ASCII character" : ""}`,
+        );
+      }
+    }
     const init: RequestInit = {
       method,
       headers,
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     };
 
+    const repeatable = idempotent || REPEATABLE_METHODS.has(method);
     let rateLimited = 0;
     let failures = 0;
     for (;;) {
@@ -309,7 +387,7 @@ export function createHttp(options: HttpOptions): HttpClient {
       } catch (error) {
         const reason = networkReason(error);
         failures += 1;
-        if (failures >= maxAttempts) {
+        if (!repeatable || failures >= maxAttempts) {
           const hint =
             name === "BillionSend"
               ? "check --to-url / BILLIONSEND_BASE_URL"
@@ -318,6 +396,8 @@ export function createHttp(options: HttpOptions): HttpClient {
             0,
             "network_error",
             `${name}: ${label} failed ${failures} times — ${reason}; ${hint}`,
+            null,
+            !repeatable,
           );
         }
         const wait = 1000 * 2 ** (failures - 1);
@@ -344,6 +424,14 @@ export function createHttp(options: HttpOptions): HttpClient {
           );
         }
         const wait = retryAfterMs(response.headers) ?? 2000;
+        if (wait > MAX_RETRY_AFTER_MS) {
+          throw new ApiError(
+            429,
+            "rate_limit_exceeded",
+            `${name} asks to wait ${Math.round(wait / 1000)}s after rate limiting ${label}; not waiting more than ${MAX_RETRY_AFTER_MS / 1000}s`,
+            parsed,
+          );
+        }
         rps = Math.max(1, rps / 2);
         rampedAt = Date.now();
         log.warn(
@@ -354,12 +442,13 @@ export function createHttp(options: HttpOptions): HttpClient {
       }
       if (status >= 500) {
         failures += 1;
-        if (failures >= maxAttempts) {
+        if (!repeatable || failures >= maxAttempts) {
           throw new ApiError(
             status,
             "server_error",
-            `${name} answered ${status} to ${label} ${failures} times`,
+            `${name} answered ${status} to ${label}${failures > 1 ? ` ${failures} times` : ""}${repeatable ? "" : "; it is not sent again, because it may have been written (run again to continue)"}`,
             parsed,
+            !repeatable,
           );
         }
         const wait = 1000 * 2 ** (failures - 1);

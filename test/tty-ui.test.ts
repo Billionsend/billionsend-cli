@@ -12,14 +12,11 @@ import {
   multiSelectPrompt,
   optionRow,
   pickBannerTier,
-  railOptionRow,
   rowsFor,
   secretPrompt,
   secretPromptMode,
   selectPrompt,
-  textPrompt,
   visibleLength,
-  wrapText,
 } from "../src/tty-ui.js";
 import { stripControl, truncate } from "../src/utils.js";
 
@@ -168,13 +165,6 @@ describe("cursorTracker", () => {
     expect(cursor.row()).toBe(2);
     cursor.feed("\x1b[3A\x1b[J");
     expect(cursor.row()).toBe(-1);
-  });
-});
-
-describe("wrapText", () => {
-  it("wraps greedily and leaves long words unbroken", () => {
-    expect(wrapText("aa bb cc dd", 5)).toBe("aa bb\ncc dd");
-    expect(wrapText("abcdefghij k", 4)).toBe("abcdefghij\nk");
   });
 });
 
@@ -355,19 +345,6 @@ describe("piped prompts", () => {
     expect(await confirmPrompt(rl, { label: "Proceed?", initial: true })).toBe(false);
     rl.close();
   });
-
-  it("textPrompt: empty takes the initial; an invalid piped answer throws", async () => {
-    const { rl, output } = reader("\nnot a url\n");
-    expect(await textPrompt(rl, { label: "API URL", initial: "https://a" })).toBe("https://a");
-    expect(output.read()?.toString()).toBe("API URL [https://a]: ");
-    await expect(
-      textPrompt(rl, {
-        label: "API URL",
-        validate: (v) => (v.startsWith("https://") ? undefined : "must start with https://"),
-      }),
-    ).rejects.toThrow("API URL: must start with https://");
-    rl.close();
-  });
 });
 
 describe("maskSecret", () => {
@@ -423,20 +400,6 @@ describe("optionRow", () => {
     expect(cut).toBe("❯ [x] Enrichment — properties and topic subscriptions (12,…");
     const short = optionRow("  ", option, false, 20);
     expect(short).toBe("  Enrichment — pro…");
-  });
-});
-
-describe("railOptionRow", () => {
-  it("marks the highlighted row with a filled dot and cuts the hint before the label", () => {
-    setColorMode("never");
-    expect(railOptionRow({ value: "a", label: "Add a region", hint: "no new key" }, true, 80)).toBe(
-      "│  ● Add a region  no new key",
-    );
-    expect(railOptionRow({ value: "b", label: "Skip" }, false, 80)).toBe("│  ○ Skip");
-    expect(railOptionRow({ value: "c", label: "Label", hint: "a long hint" }, false, 20)).toBe(
-      "│  ○ Label  a long…",
-    );
-    setColorMode("auto");
   });
 });
 

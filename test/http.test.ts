@@ -7,7 +7,9 @@ import {
   nextCursor,
   PaginationError,
   pageItems,
+  RequestError,
   retryAfterMs,
+  route,
 } from "../src/http.js";
 import { createLogger } from "../src/log.js";
 
@@ -144,6 +146,71 @@ describe("createHttp", () => {
     expect(lines.some((l) => l.startsWith("warning: retry 2/8 in 3s — Resend 429"))).toBe(true);
   });
 
+  it("429 is retried for every method, since the API refuses before it writes anything", async () => {
+    for (const method of ["post", "patch", "delete"] as const) {
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce(json(429, {}, { "retry-after": "2" }))
+        .mockResolvedValueOnce(json(200, { ok: true }));
+      const client = http(fetchMock);
+      const pending = method === "delete" ? client.delete("/x") : client[method]("/x", { a: 1 });
+      await vi.runAllTimersAsync();
+      expect((await pending).status, method).toBe(200);
+      expect(fetchMock, method).toHaveBeenCalledTimes(2);
+      // The retry carries the same body.
+      expect(fetchMock.mock.calls[1]?.[1]?.body, method).toBe(
+        method === "delete" ? undefined : '{"a":1}',
+      );
+    }
+  });
+
+  it("429 reads Retry-After as an HTTP date too", async () => {
+    vi.setSystemTime(new Date("2026-11-19T10:00:00Z"));
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(json(429, {}, { "retry-after": "Thu, 19 Nov 2026 10:00:07 GMT" }))
+      .mockResolvedValueOnce(json(200, {}));
+    const pending = http(fetchMock).post("/x", {});
+    await vi.advanceTimersByTimeAsync(6900);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect((await pending).status).toBe(200);
+  });
+
+  it("429 waits a Retry-After of 60 s, and refuses at once to wait longer", async () => {
+    const at60 = vi
+      .fn()
+      .mockResolvedValueOnce(json(429, {}, { "retry-after": "60" }))
+      .mockResolvedValueOnce(json(200, {}));
+    const waits = http(at60).get("/x");
+    await vi.advanceTimersByTimeAsync(59_900);
+    expect(at60).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(200);
+    expect((await waits).status).toBe(200);
+
+    const at61 = vi
+      .fn()
+      .mockResolvedValue(json(429, { name: "rate_limit_exceeded" }, { "retry-after": "61" }));
+    const lines: string[] = [];
+    const refuses = http(at61, lines).post("/x", {});
+    refuses.catch(() => {});
+    await vi.advanceTimersByTimeAsync(10);
+    await expect(refuses).rejects.toMatchObject({ status: 429, name: "rate_limit_exceeded" });
+    await expect(refuses).rejects.toThrow("asks to wait 61s");
+    expect(at61).toHaveBeenCalledTimes(1);
+    // The date form is held to the same limit.
+    vi.setSystemTime(new Date("2026-11-19T10:00:00Z"));
+    const date = vi
+      .fn()
+      .mockResolvedValue(json(429, {}, { "retry-after": "Thu, 19 Nov 2026 10:05:00 GMT" }));
+    const dated = http(date).get("/x");
+    dated.catch(() => {});
+    await vi.advanceTimersByTimeAsync(10);
+    await expect(dated).rejects.toMatchObject({ status: 429 });
+    expect(date).toHaveBeenCalledTimes(1);
+  });
+
   it("429 gives up after rateLimitAttempts", async () => {
     const fetchMock = vi.fn().mockImplementation(() => json(429, {}, { "ratelimit-reset": "1" }));
     const pending = http(fetchMock, [], { rateLimitAttempts: 3 }).get("/emails");
@@ -176,6 +243,65 @@ describe("createHttp", () => {
       "warning: retry 4/5 in 4s — Resend 503",
       "warning: retry 5/5 in 8s — Resend 503",
     ]);
+  });
+
+  it("a 5xx is retried for GET and DELETE, never for a POST or PATCH: the first try may have written", async () => {
+    for (const method of ["get", "delete"] as const) {
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce(json(503, {}))
+        .mockResolvedValueOnce(json(200, { ok: true }));
+      const pending = http(fetchMock)[method]("/x");
+      await vi.runAllTimersAsync();
+      expect((await pending).status, method).toBe(200);
+      expect(fetchMock, method).toHaveBeenCalledTimes(2);
+    }
+    for (const method of ["post", "patch"] as const) {
+      const fetchMock = vi.fn().mockResolvedValue(json(502, { message: "bad gateway" }));
+      const lines: string[] = [];
+      const pending = http(fetchMock, lines)[method]("/webhooks", { endpoint: "https://x" });
+      pending.catch(() => {});
+      await vi.runAllTimersAsync();
+      await expect(pending, method).rejects.toMatchObject({ status: 502 });
+      expect(fetchMock, method).toHaveBeenCalledTimes(1);
+      expect(
+        lines.filter((l) => l.startsWith("warning: retry")),
+        method,
+      ).toEqual([]);
+    }
+  });
+
+  it("a network failure or timeout is retried for GET, never for a POST", async () => {
+    const timeout = new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    for (const failure of [new TypeError("fetch failed"), timeout]) {
+      const get = vi.fn().mockRejectedValueOnce(failure).mockResolvedValueOnce(json(200, {}));
+      const read = http(get).get("/x");
+      await vi.runAllTimersAsync();
+      expect((await read).status).toBe(200);
+      expect(get).toHaveBeenCalledTimes(2);
+
+      const post = vi.fn().mockRejectedValue(failure);
+      const write = http(post).post("/x", {});
+      write.catch(() => {});
+      await vi.runAllTimersAsync();
+      await expect(write).rejects.toMatchObject({ status: 0, name: "network_error" });
+      expect(post).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("a POST that only reads or is idempotent by itself says so and is retried like a GET", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(json(503, {}))
+      .mockResolvedValueOnce(json(200, { ok: true }));
+    const pending = http(fetchMock).post(
+      "/contacts/batch/get",
+      { contacts: [] },
+      { idempotent: true },
+    );
+    await vi.runAllTimersAsync();
+    expect((await pending).status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("network failures retry like 5xx and succeed when the network comes back", async () => {
@@ -221,6 +347,72 @@ describe("createHttp", () => {
     await expect(target).rejects.toThrow(
       "BillionSend: GET /usage failed 1 times — fetch failed (ECONNREFUSED 10.0.0.5:3000); check --to-url / BILLIONSEND_BASE_URL",
     );
+  });
+
+  it("a 2xx with no body is a success with a null body, not a JSON error", async () => {
+    for (const status of [200, 204]) {
+      const fetchMock = vi.fn().mockImplementation(() => new Response(null, { status }));
+      const pending = http(fetchMock).delete("/contacts/1");
+      await vi.runAllTimersAsync();
+      expect(await pending, String(status)).toMatchObject({ status, body: null });
+    }
+    const empty = vi.fn().mockResolvedValue(new Response("", { status: 200 }));
+    const get = http(empty).get("/x");
+    await vi.runAllTimersAsync();
+    expect((await get).body).toBeNull();
+  });
+
+  it("refuses a path with an empty, `.` or `..` segment before sending anything", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(json(200, {}));
+    const client = http(fetchMock);
+    for (const path of [
+      "/templates/",
+      "/templates/.",
+      "/templates/..",
+      "/templates/%2e%2e",
+      "/a//b",
+      "/templates/..?x=1",
+    ]) {
+      await expect(client.get(path), path).rejects.toBeInstanceOf(RequestError);
+      await expect(client.delete(path), path).rejects.toThrow("an id is missing or not an id");
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+    // A dot inside a segment is an ordinary name.
+    const ok = client.get("/templates/welcome.v2");
+    await vi.runAllTimersAsync();
+    expect((await ok).status).toBe(200);
+  });
+
+  it("route() puts each value in as one encoded segment", () => {
+    expect(route`/contacts/${"a@b.com"}/segments/${"x y"}`).toBe(
+      "/contacts/a%40b.com/segments/x%20y",
+    );
+    expect(route`/t/${"a/b"}`).toBe("/t/a%2Fb");
+    expect(route`/t/${"订单+1"}`).toBe("/t/%E8%AE%A2%E5%8D%95%2B1");
+    // The values keep their order.
+    expect(route`/a/${"1"}/b/${"2"}`).toBe("/a/1/b/2");
+  });
+
+  it("refuses a header value a header cannot carry, naming the header and never the value", async () => {
+    const secret = "bs_secret_key_value";
+    const fetchMock = vi.fn().mockResolvedValue(json(200, {}));
+    const withKey = (token: string) => http(fetchMock, [], { token, name: "BillionSend" });
+    for (const token of [`${secret}\nmore`, `${secret}订`, `${secret}\u0007`]) {
+      const error = await withKey(token)
+        .get("/usage")
+        .catch((e: unknown) => e);
+      expect(error, token).toBeInstanceOf(RequestError);
+      expect((error as Error).message).toContain("the authorization header");
+      expect((error as Error).message).not.toContain(secret);
+    }
+    const custom = await http(fetchMock)
+      .post("/x", {}, { headers: { "idempotency-key": "welcome/订单-1" } })
+      .catch((e: unknown) => e);
+    expect(custom).toBeInstanceOf(RequestError);
+    expect((custom as Error).message).toContain("the idempotency-key header");
+    expect((custom as Error).message).not.toContain("订单");
+    // Not sent, and not retried as if the network had failed.
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("readOnly refuses every non-GET before touching the network", async () => {

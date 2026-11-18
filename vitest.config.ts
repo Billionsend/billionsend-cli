@@ -13,10 +13,17 @@ export default defineConfig({
     globalSetup: ["test/global-setup.ts"],
     coverage: {
       provider: "v8",
-      include: ["src/**"],
+      // The tests that run the built bundle as a child process count too: Vitest hands the child its
+      // NODE_V8_COVERAGE, and the bundle's source map puts its lines back on src/.
+      autoAttachSubprocess: true,
+      // The bundle sits in dist/, which is excluded by default; what counts is the src/ file it maps to.
+      excludeAfterRemap: true,
+      // The built bundle's own path must pass the filter to be read; its lines are then put back on src/.
+      include: ["src/**", "dist/index.js"],
+      exclude: ["node_modules/**", "test/**"],
       reporter: ["text", "json-summary"],
-      // The floor of the in-process suites (the subprocess runs of the built bundle are not counted).
-      thresholds: { statements: 88, branches: 80, functions: 91, lines: 90 },
+      // Measured with the child processes counted: statements 99.1, branches 95.3, functions 99.6, lines 99.7.
+      thresholds: { statements: 97, branches: 95, functions: 97, lines: 97 },
     },
   },
 });

@@ -55,10 +55,7 @@ async function resolveKey(
     if (line === "") throw new Error(`No ${label} arrived on stdin (${flag}-stdin).`);
     return line;
   }
-  if (ctx.config.nonInteractive) {
-    throw new Error(`Missing ${label}. Set ${envName} or pass ${flag}-stdin.`);
-  }
-  const key = await secretPrompt(ctx.rl, { label: `${label} (full access)` });
+  const key = (await secretPrompt(ctx.rl, { label: `${label} (full access)` })).trim();
   if (key === "") throw new Error(`Missing ${label}. Set ${envName} or pass ${flag}-stdin.`);
   return key;
 }

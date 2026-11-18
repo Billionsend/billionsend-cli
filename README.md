@@ -64,6 +64,8 @@ Your Resend key never leaves your machine — the tool only ever contacts `api.r
 
 Every run is a diff: properties, topics, segments, domains, templates and webhooks are updated when they differ and left alone when they match. Contacts are upserted; the API does not say whether a matched contact changed, so the summary counts them as `matched existing`. Run `billionsend migrate --from resend` again right before cutover to sync the contacts that arrived in between.
 
+A `429` is waited out on every request, as long as `Retry-After` asks (seconds or an HTTP date) up to 60 seconds; a longer wait is an error. A `5xx`, a timeout or a lost connection is tried again only for reads and deletes; a write (create, update, batch) is sent once, because it may have gone through, and a failure is recorded in the summary: run the command again and it continues from where it stopped.
+
 `billionsend migrate rollback` deletes only the ids the tool created (never rows it merely updated), in reverse dependency order, after showing the list and asking for confirmation. Bounce and complaint suppressions are permanent on BillionSend: rollback leaves the ones it added in place and says so.
 
 ## Development

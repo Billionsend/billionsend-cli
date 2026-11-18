@@ -7,6 +7,7 @@ import {
   nextCursor,
   pageItems,
   type RequestOptions,
+  route,
 } from "./http.js";
 import type { Logger } from "./log.js";
 import { VERSION } from "./meta.js";
@@ -132,15 +133,20 @@ type BatchWire = Omit<BatchOutcome, "errors"> & { errors?: BatchOutcome["errors"
 
 const PERMISSIVE = { headers: { "x-batch-validation": "permissive" } };
 
-/** A 4xx the API answered for this one write; anything else (auth, network, 5xx) keeps propagating. */
+/**
+ * A 4xx the API answered for this one write, or a write that failed after being sent once (a 5xx or a
+ * lost connection on a POST or PATCH): recorded as failed, the run goes on and a re-run picks it up.
+ * Anything else (auth, a read or delete that kept failing) keeps propagating.
+ */
 function writeError(error: unknown): WriteError | null {
-  if (!(error instanceof ApiError) || error.status < 400 || error.status >= 500) return null;
+  if (!(error instanceof ApiError)) return null;
+  if (!error.sentOnce && (error.status < 400 || error.status >= 500)) return null;
   const body = error.body as { message?: unknown } | null;
   return {
     ok: false,
     status: error.status,
     name: error.name,
-    message: typeof body?.message === "string" ? body.message : error.message,
+    message: !error.sentOnce && typeof body?.message === "string" ? body.message : error.message,
   };
 }
 
@@ -176,8 +182,9 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
     }
   }
 
-  const id = async (response: Promise<{ body: { id: string } }>) => ({
-    id: (await response).body.id,
+  /** The id an answer carries, or `known` when the answer has no body (a 204). */
+  const id = async (response: Promise<{ body: { id: string } | null }>, known = "") => ({
+    id: (await response).body?.id ?? known,
   });
 
   const withRecords = async (response: Promise<{ body: DomainWire }>) => {
@@ -270,7 +277,7 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
     // The team's subdomain of the shared inbox domain is no domain of its own:
     // it takes no slot of limits.domains.
     for (const { id } of domainRows.filter((row) => row.shared !== true)) {
-      const { body } = await api.get<DomainWire>(`/domains/${id}`);
+      const { body } = await api.get<DomainWire>(route`/domains/${id}`);
       domains.push({
         id: body.id,
         name: body.name,
@@ -282,7 +289,7 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
     // The list carries no bodies; the plan diffs subject/html/text against them.
     const templates: TargetTemplate[] = [];
     for (const { id } of templateRows) {
-      const { body } = await api.get<TemplateWire>(`/templates/${id}`);
+      const { body } = await api.get<TemplateWire>(route`/templates/${id}`);
       templates.push({
         id: body.id,
         name: body.name,
@@ -345,10 +352,15 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
     const rows: ContactLookupRow[] = [];
     const ask = async (slice: string[]): Promise<void> => {
       try {
-        const { body } = await api.post<{ data: ContactLookupRow[] }>("/contacts/batch/get", {
-          contacts: slice.map((email) => ({ email })),
-          ...(include === null ? {} : { include: [include] }),
-        });
+        const { body } = await api.post<{ data: ContactLookupRow[] }>(
+          "/contacts/batch/get",
+          {
+            contacts: slice.map((email) => ({ email })),
+            ...(include === null ? {} : { include: [include] }),
+          },
+          // It only reads.
+          { idempotent: true },
+        );
         rows.push(...body.data);
       } catch (error) {
         if (!(error instanceof ApiError) || error.status !== 422) throw error;
@@ -490,7 +502,7 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
         ),
       ),
     deleteProperty: (propertyId: string) =>
-      write(() => id(api.delete(`/contact-properties/${propertyId}`))),
+      write(() => id(api.delete(route`/contact-properties/${propertyId}`), propertyId)),
 
     createTopic: (input: {
       name: string;
@@ -518,14 +530,15 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
     ) =>
       write(() =>
         id(
-          api.patch(`/topics/${topicId}`, {
+          api.patch(route`/topics/${topicId}`, {
             name: input.name,
             description: input.description ?? undefined,
             visibility: input.visibility,
           }),
         ),
       ),
-    deleteTopic: (topicId: string) => write(() => id(api.delete(`/topics/${topicId}`))),
+    deleteTopic: (topicId: string) =>
+      write(() => id(api.delete(route`/topics/${topicId}`), topicId)),
 
     createSegment: (input: { name: string; filter?: unknown }) =>
       write(() =>
@@ -540,13 +553,14 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
     updateSegment: (segmentId: string, input: { name?: string | undefined; filter?: unknown }) =>
       write(() =>
         id(
-          api.patch(`/segments/${segmentId}`, {
+          api.patch(route`/segments/${segmentId}`, {
             name: input.name,
             ...(input.filter !== undefined ? { filter: input.filter } : {}),
           }),
         ),
       ),
-    deleteSegment: (segmentId: string) => write(() => id(api.delete(`/segments/${segmentId}`))),
+    deleteSegment: (segmentId: string) =>
+      write(() => id(api.delete(route`/segments/${segmentId}`), segmentId)),
 
     createDomain: (input: { name: string; customReturnPath?: string | null | undefined }) =>
       write(() =>
@@ -567,14 +581,15 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
     ) =>
       write(() =>
         withRecords(
-          api.patch<DomainWire>(`/domains/${domainId}`, {
+          api.patch<DomainWire>(route`/domains/${domainId}`, {
             open_tracking: input.openTracking,
             click_tracking: input.clickTracking,
             tracking_subdomain: input.trackingSubdomain,
           }),
         ),
       ),
-    deleteDomain: (domainId: string) => write(() => id(api.delete(`/domains/${domainId}`))),
+    deleteDomain: (domainId: string) =>
+      write(() => id(api.delete(route`/domains/${domainId}`), domainId)),
 
     createWebhook: (input: {
       endpoint: string;
@@ -596,8 +611,9 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
         events?: string[] | undefined;
         status?: "enabled" | "disabled" | undefined;
       },
-    ) => write(() => id(api.patch(`/webhooks/${webhookId}`, input))),
-    deleteWebhook: (webhookId: string) => write(() => id(api.delete(`/webhooks/${webhookId}`))),
+    ) => write(() => id(api.patch(route`/webhooks/${webhookId}`, input))),
+    deleteWebhook: (webhookId: string) =>
+      write(() => id(api.delete(route`/webhooks/${webhookId}`), webhookId)),
 
     createTemplate: (input: {
       name: string;
@@ -636,8 +652,9 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
         text?: string | null | undefined;
         variables?: TemplateVariableInput[] | undefined;
       },
-    ) => write(() => id(api.patch(`/templates/${idOrAlias}`, input))),
-    deleteTemplate: (idOrAlias: string) => write(() => id(api.delete(`/templates/${idOrAlias}`))),
+    ) => write(() => id(api.patch(route`/templates/${idOrAlias}`, input))),
+    deleteTemplate: (idOrAlias: string) =>
+      write(() => id(api.delete(route`/templates/${idOrAlias}`), idOrAlias)),
 
     /** Always a draft; sending stays a deliberate act in the dashboard. */
     createBroadcast: (input: {
@@ -667,14 +684,16 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
         ),
       ),
     deleteBroadcast: (broadcastId: string) =>
-      write(() => id(api.delete(`/broadcasts/${broadcastId}`))),
+      write(() => id(api.delete(route`/broadcasts/${broadcastId}`), broadcastId)),
 
     findContacts,
     explicitOptOuts,
     batchContacts,
     deleteContact: (contactId: string) =>
       write(async () => ({
-        id: (await api.delete<{ contact: string }>(`/contacts/${contactId}`)).body.contact,
+        id:
+          (await api.delete<{ contact: string } | null>(route`/contacts/${contactId}`)).body
+            ?.contact ?? contactId,
       })),
     /** Prefer inline `segments` on batch items; this is one request per contact. */
     addContactsToSegment: async (segmentId: string, contactIds: string[]) => {
@@ -682,7 +701,7 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
       const errors: { id: string; message: string }[] = [];
       for (const contactId of contactIds) {
         const result = await write(() =>
-          id(api.post(`/contacts/${contactId}/segments/${segmentId}`)),
+          id(api.post(route`/contacts/${contactId}/segments/${segmentId}`)),
         );
         if (result.ok) added.push(result.id);
         else errors.push({ id: contactId, message: result.message });

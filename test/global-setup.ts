@@ -4,7 +4,8 @@ import { promisify } from "node:util";
 
 /** One build before any test file: the subprocess tests all run the same dist/index.js. */
 export async function setup(): Promise<void> {
-  await promisify(execFile)("pnpm", ["build"], {
+  // The map lets a coverage run attribute the bundle's lines to src/ (and costs nothing otherwise).
+  await promisify(execFile)("pnpm", ["build", "--sourcemap=linked"], {
     cwd: fileURLToPath(new URL("..", import.meta.url)),
   });
 }

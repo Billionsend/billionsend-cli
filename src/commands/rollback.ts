@@ -73,7 +73,6 @@ export async function rollback(ctx: Context): Promise<number> {
   }
   out.write(`${capitalize(formatDuration(requests / TARGET_RPS))} at ${TARGET_RPS} req/s.\n\n`);
   if (!config.yes) {
-    if (config.nonInteractive) throw new Error("Rollback needs --yes in non-interactive mode.");
     if (!(await confirmPrompt(ctx.rl, { label: "Delete these from your BillionSend instance?" }))) {
       out.write("Nothing deleted.\n");
       emitJson([]);

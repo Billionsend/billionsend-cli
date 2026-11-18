@@ -445,7 +445,7 @@ export function createResendSource(http: Http, log: Logger): Source {
       const membersOf = async (id: string): Promise<WireContact[]> => {
         const cached = memberLists.get(id);
         if (cached !== undefined) return cached;
-        const members = await listAll<WireContact>(`/segments/${id}/contacts`, {});
+        const members = await listAll<WireContact>(path("segments", id, "contacts"), {});
         memberLists.set(id, members);
         return members;
       };

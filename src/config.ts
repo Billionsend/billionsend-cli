@@ -150,14 +150,15 @@ function keyInput(
   if (stdinFlag && flagValue !== undefined) {
     throw new ConfigError(`Pass either ${flagName} or ${flagName}-stdin, not both.`);
   }
-  const fromEnv = env[envName];
+  // A key pasted or exported with a line break or spaces around it is the key without them.
+  const fromEnv = env[envName]?.trim();
   if (fromEnv !== undefined && fromEnv !== "") return { source: "env", value: fromEnv };
   if (stdinFlag) return { source: "stdin", value: null };
   if (flagValue !== undefined) {
     warnings.push(
       `${flagName} is visible to other users in process lists; prefer ${envName} or ${flagName}-stdin.`,
     );
-    return { source: "flag", value: flagValue };
+    return { source: "flag", value: flagValue.trim() };
   }
   return { source: "prompt", value: null };
 }

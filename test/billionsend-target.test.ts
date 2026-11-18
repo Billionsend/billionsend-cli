@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   BATCH_MAX,
   type BillionSendTarget,
@@ -695,6 +695,137 @@ describe("the team's subdomain of the shared inbox domain", () => {
       expect(paths.filter((path) => path.startsWith("/domains/"))).toEqual([`/domains/${own}`]);
     } finally {
       await api.stop();
+    }
+  });
+});
+
+describe("ids in a path", () => {
+  it("a slash or a dot-dot in an id cannot reach another route; an empty id is refused before sending", async () => {
+    const seen: string[] = [];
+    const answer: typeof fetch = async (url, init) => {
+      seen.push(`${init?.method} ${new URL(String(url)).pathname}`);
+      return new Response(null, { status: 204 });
+    };
+    const stub = createBillionSendTarget(
+      createHttp({
+        baseUrl: "https://api.example.test",
+        token: "bs_test",
+        userAgent: "billionsend-cli/test",
+        rps: 1000,
+        name: "BillionSend",
+        log,
+        fetch: answer,
+      }),
+      log,
+    );
+    // A 204 with no body is a success that names the id it deleted.
+    expect(await stub.deleteTopic("../domains/abc")).toEqual({ ok: true, id: "../domains/abc" });
+    expect(await stub.deleteContact("c1")).toEqual({ ok: true, id: "c1" });
+    expect(seen).toEqual(["DELETE /topics/..%2Fdomains%2Fabc", "DELETE /contacts/c1"]);
+    await expect(stub.deleteTopic("..")).rejects.toThrow("an id is missing or not an id");
+    await expect(stub.deleteTemplate("")).rejects.toThrow("an id is missing or not an id");
+    expect(seen).toHaveLength(2);
+  });
+});
+
+describe("a write the server answered with a 5xx", () => {
+  /** A target whose API answers every request with 503, counting what it was sent. */
+  function down() {
+    const seen: string[] = [];
+    const answer: typeof fetch = async (url, init) => {
+      seen.push(`${init?.method} ${new URL(String(url)).pathname}`);
+      return new Response(JSON.stringify({ name: "internal_error", message: "down" }), {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const stub = createBillionSendTarget(
+      createHttp({
+        baseUrl: "https://api.example.test",
+        token: "bs_test",
+        userAgent: "billionsend-cli/test",
+        rps: 1000,
+        name: "BillionSend",
+        log,
+        fetch: answer,
+        maxAttempts: 3,
+      }),
+      log,
+    );
+    return { stub, seen };
+  }
+
+  it("is sent once and recorded as failed, never repeated: a webhook, a template and a contacts batch", async () => {
+    const { stub, seen } = down();
+    const webhook = await stub.createWebhook({
+      endpoint: "https://hooks.example.test/x",
+      events: ["email.sent"],
+    });
+    expect(webhook).toMatchObject({ ok: false, status: 503 });
+    expect(await stub.createTemplate({ name: "T", html: "<p>x</p>" })).toMatchObject({
+      ok: false,
+      status: 503,
+    });
+    const batch = await stub.batchContacts(
+      [{ email: "a@example.com" }, { email: "b@example.com" }],
+      {
+        onConflict: "upsert",
+      },
+    );
+    expect(batch.counts.failed).toBe(2);
+    expect(batch.errors.map((e) => e.statusCode)).toEqual([503, 503]);
+    expect(seen).toEqual(["POST /webhooks", "POST /templates", "POST /contacts/batch"]);
+    expect(webhook).toMatchObject({
+      message: expect.stringContaining("it is not sent again, because it may have been written"),
+    });
+  });
+
+  it("a lost connection on a write is recorded the same way, with status 0", async () => {
+    const seen: string[] = [];
+    const lost: typeof fetch = async (url, init) => {
+      seen.push(`${init?.method} ${new URL(String(url)).pathname}`);
+      throw new TypeError("fetch failed");
+    };
+    const stub = createBillionSendTarget(
+      createHttp({
+        baseUrl: "https://api.example.test",
+        token: "bs_test",
+        userAgent: "billionsend-cli/test",
+        rps: 1000,
+        name: "BillionSend",
+        log,
+        fetch: lost,
+      }),
+      log,
+    );
+    expect(await stub.createTopic({ name: "News", defaultSubscription: "opt_in" })).toMatchObject({
+      ok: false,
+      status: 0,
+      name: "network_error",
+    });
+    expect(seen).toEqual(["POST /topics"]);
+  });
+
+  it("a read and a delete are tried again, and so is the lookup of contacts, which only reads", async () => {
+    vi.useFakeTimers();
+    try {
+      const { stub, seen } = down();
+      const deleted = stub.deleteContact("00000000-0000-4000-8000-000000000000");
+      deleted.catch(() => {});
+      await vi.runAllTimersAsync();
+      const found = stub.findContacts(["a@example.com"]);
+      found.catch(() => {});
+      await vi.runAllTimersAsync();
+      expect(seen).toEqual([
+        "DELETE /contacts/00000000-0000-4000-8000-000000000000",
+        "DELETE /contacts/00000000-0000-4000-8000-000000000000",
+        "DELETE /contacts/00000000-0000-4000-8000-000000000000",
+        "POST /contacts/batch/get",
+        "POST /contacts/batch/get",
+        "POST /contacts/batch/get",
+      ]);
+    } finally {
+      vi.useRealTimers();
     }
   });
 });
