@@ -532,8 +532,13 @@ describe("what a run reports", () => {
     async () => {
       const { code, stdout } = await run(["migrate", "--from", "resend", "--yes"]);
       expect(code).toBe(0);
-      expect(stdout.replace(/\s+/g, " ")).toContain(
-        `set RESEND_BASE_URL=https://api.billionsend.com in your app, so Resend SDK calls go to BillionSend (this run used ${api.baseUrl};`,
+      expect(stdout).toContain(
+        [
+          "  [ ] set RESEND_BASE_URL=https://api.billionsend.com in your app, so Resend SDK",
+          `      calls go to BillionSend (this run used ${api.baseUrl}; put that`,
+          "      address there only if your app reaches BillionSend through it)",
+          "",
+        ].join("\n"),
       );
       expect(stdout).not.toContain(`RESEND_BASE_URL=${api.baseUrl}`);
       expect(readReportIn(dir).checklist.left.join("\n")).not.toContain(

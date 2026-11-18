@@ -33,11 +33,13 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "openapi:sync": "node scripts/sync-openapi.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.15",
     "@types/node": "^24.19.2",
+    "@vitest/coverage-v8": "5.1.0",
     "ajv": "^8.17.1",
     "ajv-formats": "^3.0.1",
     "esbuild": "^0.28.2",

@@ -13,6 +13,7 @@ import { VERSION } from "./meta.js";
 import type {
   DnsRecord,
   TargetBroadcast,
+  TargetContact,
   TargetDomain,
   TargetProperty,
   TargetSegment,
@@ -25,7 +26,20 @@ import type {
 import { TARGET_ALL_EVENTS, type TemplateVariableInput } from "./translate.js";
 import { chunk } from "./utils.js";
 
-/** POST /contacts/batch and /suppressions/batch/* accept at most this many items. */
+/** What the API accepts as an address in POST /contacts/batch/get; anything else answers 422 for the whole request. */
+const LOOKUP_EMAIL =
+  /^(?!\.)(?!.*\.\.)([A-Za-z0-9_'+\-.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9-]*\.)+[A-Za-z]{2,}$/;
+
+/** One contact of a POST /contacts/batch/get answer, as far as the CLI reads it. */
+interface ContactLookupRow {
+  email: string;
+  first_name: string | null;
+  last_name: string | null;
+  unsubscribed: boolean;
+  topics?: { id: string; subscription: "opt_in" | "opt_out"; explicit: boolean }[];
+}
+
+/** POST /contacts/batch, /contacts/batch/get and /suppressions/batch/* accept at most this many items. */
 export const BATCH_MAX = 1000;
 
 export interface WriteError {
@@ -287,6 +301,7 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
     }
     return {
       usage,
+      contacts: new Map(),
       domains,
       hasContacts: firstContact.body.data.length > 0,
       properties: properties.map(({ id, key, type }) => ({ id, key, type })),
@@ -313,6 +328,66 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
         (b): TargetBroadcast => ({ id: b.id, name: b.name ?? "", status: b.status }),
       ),
     };
+  }
+
+  /**
+   * POST /contacts/batch/get for these addresses (case insensitive), 1000 a
+   * request: the cost grows with the source's contacts and never with the
+   * target's. An address the API would refuse as malformed is left out of the
+   * request, and a request the API still refuses is split until the offending
+   * address is alone; such an address is simply not found (the upsert refuses it
+   * on its own).
+   */
+  async function lookupContacts(
+    emails: readonly string[],
+    include: "topics" | null,
+  ): Promise<ContactLookupRow[]> {
+    const rows: ContactLookupRow[] = [];
+    const ask = async (slice: string[]): Promise<void> => {
+      try {
+        const { body } = await api.post<{ data: ContactLookupRow[] }>("/contacts/batch/get", {
+          contacts: slice.map((email) => ({ email })),
+          ...(include === null ? {} : { include: [include] }),
+        });
+        rows.push(...body.data);
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.status !== 422) throw error;
+        if (slice.length === 1) return;
+        const half = Math.ceil(slice.length / 2);
+        await ask(slice.slice(0, half));
+        await ask(slice.slice(half));
+      }
+    };
+    const askable = [...new Set(emails.filter((email) => LOOKUP_EMAIL.test(email)))];
+    for (const slice of chunk(askable, BATCH_MAX)) await ask(slice);
+    return rows;
+  }
+
+  /** Which of these addresses are contacts on the target already, with what the plan compares. */
+  async function findContacts(emails: readonly string[]): Promise<Map<string, TargetContact>> {
+    const found = new Map<string, TargetContact>();
+    for (const row of await lookupContacts(emails, null)) {
+      found.set(row.email.toLowerCase(), {
+        firstName: row.first_name,
+        lastName: row.last_name,
+        unsubscribed: row.unsubscribed,
+      });
+    }
+    return found;
+  }
+
+  /**
+   * The topics each of these contacts has opted out of on the target by an
+   * explicit choice of their own or of the API (not the topic's default), by
+   * lowercased address. A migration never writes an opt-in over one of these.
+   */
+  async function explicitOptOuts(emails: readonly string[]): Promise<Map<string, Set<string>>> {
+    const out = new Map<string, Set<string>>();
+    for (const row of await lookupContacts(emails, "topics")) {
+      const topics = (row.topics ?? []).filter((t) => t.explicit && t.subscription === "opt_out");
+      if (topics.length > 0) out.set(row.email.toLowerCase(), new Set(topics.map((t) => t.id)));
+    }
+    return out;
   }
 
   async function batchContacts(
@@ -594,6 +669,8 @@ export function createBillionSendTarget(http: Http, log: Logger, baseUrl = "the 
     deleteBroadcast: (broadcastId: string) =>
       write(() => id(api.delete(`/broadcasts/${broadcastId}`))),
 
+    findContacts,
+    explicitOptOuts,
     batchContacts,
     deleteContact: (contactId: string) =>
       write(async () => ({

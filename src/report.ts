@@ -420,8 +420,9 @@ export async function printSummary(out: OutStream, raw: Report): Promise<void> {
   if (report.failures.length > 0) {
     out.write("\nFailed:\n");
     for (const f of report.failures) {
-      // An address stays in one piece: only the words around it wrap.
-      line(`${err(SYM.err)} ${f.resource}/${f.key} — ${f.message}`, { ...ITEM, keep: [f.key] });
+      // The symbol, the resource and the address stay in one piece: only the words after the dash wrap.
+      const head = `${err(SYM.err)} ${f.resource}/${f.key}`;
+      line(`${head} — ${f.message}`, { ...ITEM, keep: [head, f.key] });
     }
   }
   out.write(`\n${dim(wrapIndent(SYNC_HINT(report.source)))}\n`);

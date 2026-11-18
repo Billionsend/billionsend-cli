@@ -256,9 +256,12 @@ export async function applyPlan(input: ApplyInput): Promise<ApplyOutcome> {
     if (sourceSegment) segmentBySource.set(sourceSegment.id, id);
   };
   for (const item of plan.items) {
-    if (item.action === "unchanged") tally(item.resource).unchanged += 1;
-    else if (item.action === "manual") tally(item.resource).manual += 1;
-    else if (item.action === "skip") tally(item.resource).skipped += 1;
+    // The contacts' own numbers are what the batch endpoint answers per contact, never the plan's items.
+    if (item.resource !== "contacts") {
+      if (item.action === "unchanged") tally(item.resource).unchanged += 1;
+      else if (item.action === "manual") tally(item.resource).manual += 1;
+      else if (item.action === "skip") tally(item.resource).skipped += 1;
+    }
     if (item.resource === "properties" && item.action === "manual") {
       const collidesWith = (item.payload as { collidesWith?: string } | undefined)?.collidesWith;
       if (collidesWith !== undefined) collidingKeys.set(item.key, collidesWith);
@@ -542,6 +545,27 @@ export async function applyPlan(input: ApplyInput): Promise<ApplyOutcome> {
       for (const line of lines) progress.line(line);
       progress.line("");
     }
+    /**
+     * An opt-out a contact made on BillionSend stays: an opt-in is never written over
+     * an explicit opt-out there. A contact created in this very run has none to keep.
+     */
+    const keepTargetOptOuts = async (
+      entries: { item: ContactBatchItem; created: boolean }[],
+    ): Promise<void> => {
+      const asking = entries.filter(
+        (e) => !e.created && e.item.topics?.some((t) => t.subscription === "opt_in") === true,
+      );
+      if (asking.length === 0) return;
+      const optedOut = await target.explicitOptOuts(asking.map((e) => e.item.email));
+      for (const e of asking) {
+        const kept = optedOut.get(e.item.email.toLowerCase());
+        if (kept !== undefined) {
+          e.item.topics = e.item.topics?.filter(
+            (t) => t.subscription !== "opt_in" || !kept.has(t.id),
+          );
+        }
+      }
+    };
     for (const pass of passes) {
       if (!pass.wanted) {
         progress.line(dim(`${ENRICHMENT_LABEL[pass.facet]}: skipped, ${pass.skipped}`));
@@ -557,8 +581,9 @@ export async function applyPlan(input: ApplyInput): Promise<ApplyOutcome> {
       const failedBefore = failedIds.size;
       let processed = 0;
       let withValues = 0;
-      let buffer: { id: string; item: ContactBatchItem }[] = [];
+      let buffer: { id: string; item: ContactBatchItem; created: boolean }[] = [];
       const flush = async (): Promise<void> => {
+        if (pass.facet === "topics") await keepTargetOptOuts(buffer);
         const sendable = buffer.filter(
           (b) => b.item.properties !== undefined || b.item.topics !== undefined,
         );
@@ -623,7 +648,7 @@ export async function applyPlan(input: ApplyInput): Promise<ApplyOutcome> {
             item.first_name = contact.firstName ?? undefined;
             item.last_name = contact.lastName ?? undefined;
           }
-          buffer.push({ id: contact.id, item });
+          buffer.push({ id: contact.id, item, created: status === "created" });
           if (buffer.length >= BATCH_MAX) await flush();
         },
       });

@@ -257,8 +257,8 @@ describe("billionsend migrate", () => {
         expect(code).toBe(3);
         // The failure is listed once, in the summary; stderr carries no second copy.
         expect(stderr).toBe("");
-        expect(stdout.replace(/\s+/g, " ")).toContain(
-          "✗ domains/example.com — created, but tracking settings failed: A tracking or unsubscribe subdomain of your own needs a paid plan",
+        expect(stdout).toContain(
+          "  ✗ domains/example.com — created, but tracking settings failed: A tracking or\n    unsubscribe subdomain of your own needs a paid plan\n",
         );
         expect(stdout).toContain(`✓ BillionSend (${free.baseUrl}) · plan Free`);
         expect(stdout.replace(/\n/g, " ")).toContain(
@@ -326,7 +326,18 @@ describe("billionsend migrate", () => {
       const out = join(cwd, "plan.json");
       const changes = await run(["migrate", "plan", "--from", "resend", "--out", out]);
       expect(changes.code).toBe(2);
-      expect(changes.stdout).toContain("contacts (3)\n  + contacts  batch upsert");
+      // The first run put all three there: two are in the Active Users segment, one is in none.
+      expect(changes.stdout).toContain(
+        [
+          "contacts (3)",
+          "  ~ existing contacts  2 already on BillionSend (matched by address); the upsert",
+          "    makes sure each is in its segment and writes a name or opt-out flag that",
+          "    differs",
+          "  = existing contacts  1 already on BillionSend (matched by address); names and",
+          "    opt-out flag are the same, in no segment",
+          "",
+        ].join("\n"),
+      );
       const plan = JSON.parse(readFileSync(out, "utf8")) as Plan;
       expect(plan.version).toBe(2);
       expect(plan.target.baseUrl).toBe(api.baseUrl);
@@ -808,7 +819,7 @@ describe("migrate rollback", () => {
       ];
       // Pass 1 items carry `unsubscribed`; enrichment items never do.
       const rejectEnrichment: typeof fetch = (url, init) => {
-        if (String(url).includes("/contacts/batch") && init?.method === "POST") {
+        if (String(url).endsWith("/contacts/batch?on_conflict=upsert") && init?.method === "POST") {
           const items = JSON.parse(String(init.body)) as { unsubscribed?: boolean }[];
           if (items.every((i) => i.unsubscribed === undefined))
             return Promise.resolve(rejectJson());

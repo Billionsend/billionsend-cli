@@ -259,6 +259,7 @@ describe("createResendSource", () => {
       expect(snapshot.domains.map((d) => d.name)).toEqual(["example.com", "news.example.com"]);
       expect(fake.requests.map((r) => r.path)).not.toContain(`/domains/${sharedId}`);
       const target: TargetState = {
+        contacts: new Map(),
         usage: {
           plan: null,
           limits: { emailsPerDay: null, emailsPerMonth: null, domains: null, contacts: null },

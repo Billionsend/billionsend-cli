@@ -1,6 +1,12 @@
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { RESOURCES, type Resource, type Snapshot, type TargetState } from "../src/model.js";
+import {
+  RESOURCES,
+  type Resource,
+  type Snapshot,
+  type TargetContact,
+  type TargetState,
+} from "../src/model.js";
 import {
   buildPlan,
   describePlanDiff,
@@ -20,6 +26,7 @@ const snapshot: Snapshot = JSON.parse(
 );
 
 const emptyTarget: TargetState = {
+  contacts: new Map(),
   usage: {
     plan: null,
     limits: { emailsPerDay: null, emailsPerMonth: null, domains: null, contacts: null },
@@ -36,6 +43,7 @@ const emptyTarget: TargetState = {
 
 /** Every resource matched at least once, some differing, one verified domain, a tight domain limit. */
 const goldenTarget: TargetState = {
+  contacts: new Map(),
   usage: {
     plan: "free",
     limits: { emailsPerDay: 100, emailsPerMonth: null, domains: 1, contacts: 1000 },
@@ -136,7 +144,7 @@ api-keys
 
 Plan: 11 to create, 5 to update, 2 unchanged, 7 manual, 1 skipped.
 warning: 2 domains to create; the Free plan allows 1 (1 already there)
-Estimate: ~67 requests · 8 s at 8 req/s
+Estimate: ~68 requests · 9 s at 8 req/s
 `;
 
 const stdout = process.stdout as unknown as { columns?: number | undefined };
@@ -175,21 +183,17 @@ describe("buildPlan + renderPlan (golden)", () => {
   });
 
   it("estimates: spent + one read per contact per facet + writes; seconds cover the same requests", () => {
-    // writes: 9 creates + 4 updates + contacts batch + suppressions batch + one enrichment batch per facet = 17
-    expect(plan.estimate).toEqual({
-      requests: 40 + 10 + 17,
-      seconds: Math.ceil((40 + 10) / 8 + 17 / 10),
-    });
+    // writes: 9 creates + 4 updates + contacts lookup + contacts batch + suppressions batch + one enrichment batch per facet = 18
+    // 40 spent + 10 enrichment reads = 50 source requests at 8/s (6.25 s) + 18 target requests at 10/s (1.8 s) = 8.05 s
+    expect(plan.estimate).toEqual({ requests: 68, seconds: 9 });
     const topicsOnly = buildPlan({
       snapshot: { ...snapshot, properties: [] },
       target: goldenTarget,
       options: options(),
     });
-    // One facet: 5 reads, one write fewer (the seats property is not created).
-    expect(topicsOnly.estimate).toEqual({
-      requests: 40 + 5 + 15,
-      seconds: Math.ceil((40 + 5) / 8 + 15 / 10),
-    });
+    // One facet: 5 reads, two writes fewer (the seats property is not created, one enrichment batch less):
+    // 45 source requests at 8/s (5.625 s) + 16 target requests at 10/s (1.6 s) = 7.2 s
+    expect(topicsOnly.estimate).toEqual({ requests: 61, seconds: 8 });
   });
 
   it("carries typed payloads without secrets", () => {
@@ -320,6 +324,23 @@ describe("buildPlan against an empty target", () => {
     ]);
   });
 
+  it("a small plan after many source reads is as slow as those reads: 140 reads at 8/s is 17.5 s, not 1 s", () => {
+    // The CLI's first live run printed "~152 requests · 1 s at 8 req/s" for a plan that takes 19 s.
+    const read = (spent: number) =>
+      buildPlan({
+        snapshot: { ...snapshot, properties: [], topics: [], segments: [] },
+        target: emptyTarget,
+        options: options({
+          include: new Set<Resource>(["contacts"]),
+          sourceRequestsSpent: spent,
+          rps: 8,
+        }),
+      }).estimate;
+    // Two target requests: the lookup of the contacts, then the batch upsert. 140 / 8 + 2 / 10 = 17.7, rounded up.
+    expect(read(140)).toEqual({ requests: 142, seconds: 18 });
+    expect(read(152)).toEqual({ requests: 154, seconds: 20 });
+  });
+
   it("honours the include set and skips enrichment when nothing enriches", () => {
     const plan = buildPlan({
       snapshot: { ...snapshot, properties: [], topics: [] },
@@ -330,8 +351,8 @@ describe("buildPlan against an empty target", () => {
       ["contacts", 5],
       ["suppressions", 3],
     ]);
-    // No enrichment reads, no per-item writes: 40 spent source requests at 8/s + (1 + 1) writes at 10/s.
-    expect(plan.estimate).toEqual({ requests: 42, seconds: Math.ceil(40 / 8 + 2 / 10) });
+    // No enrichment reads, no per-item writes: 40 spent source requests at 8/s + (1 lookup + 1 upsert + 1 suppressions) at 10/s.
+    expect(plan.estimate).toEqual({ requests: 43, seconds: 6 });
     expect(plan.items[0]?.detail).toBe("batch upsert, 0 segment memberships");
   });
 
@@ -870,5 +891,141 @@ describe("describePlanDiff", () => {
     expect(lines).toContain("topics/Brand new: not in the file, in the current plan");
     expect(lines).toContain("contacts/contacts: create → create, 5 → 6");
     expect(describePlanDiff(a, a)).toEqual([]);
+  });
+});
+
+describe("contacts the target already has", () => {
+  const only = new Set<Resource>(["contacts"]);
+  const there = (
+    firstName: string | null,
+    lastName: string | null,
+    unsubscribed = false,
+  ): TargetContact => ({ firstName, lastName, unsubscribed });
+  const plan = (
+    contacts: [string, TargetContact][],
+    overrides: Partial<PlanOptions> = {},
+    target: Partial<TargetState> = {},
+  ) =>
+    buildPlan({
+      snapshot: { ...snapshot, segments: [], topics: [], properties: [] },
+      target: { ...emptyTarget, contacts: new Map(contacts), ...target },
+      options: options({ include: only, ...overrides }),
+    });
+  const contactItems = (p: ReturnType<typeof plan>) =>
+    p.items.map((i) => [i.action, i.key, i.count]);
+
+  it("none there: one create item for the whole batch, as before", () => {
+    expect(contactItems(plan([]))).toEqual([["create", "contacts", 5]]);
+  });
+
+  it("splits new from existing, matching addresses ignoring case, and says which differ", () => {
+    const p = plan([
+      // Same names and flag: nothing for the upsert to change.
+      ["steve.wozniak@gmail.com", there("Steve", "Wozniak")],
+      // A name differs.
+      ["grace.hopper@example.com", there("Gracie", "Hopper")],
+      // Unsubscribed on the source, subscribed here: the upsert writes the opt-out.
+      ["ada.lovelace@example.com", there("Ada", "Lovelace", false)],
+      // The source has no name; what the target holds is left alone.
+      ["alan.turing@example.com", there("Alan", "Turing")],
+    ]);
+    expect(contactItems(p)).toEqual([
+      ["create", "contacts", 1],
+      ["update", "existing contacts", 2],
+      ["unchanged", "existing contacts", 2],
+    ]);
+    expect(p.items[0]?.detail).toBe(
+      "1 not on BillionSend yet; batch upsert, 0 segment memberships across all 5 contacts",
+    );
+    expect(p.counts).toMatchObject({ create: 1, update: 1, unchanged: 1 });
+    expect(renderPlan(p)).toContain("contacts (5)");
+  });
+
+  it("an existing contact in a segment is upserted to make sure it is a member", () => {
+    const withSegment = buildPlan({
+      snapshot: {
+        ...snapshot,
+        topics: [],
+        properties: [],
+        segments: [
+          {
+            id: "s1",
+            name: "Active Users",
+            filter: null,
+            memberEmails: ["Steve.Wozniak@gmail.com"],
+          },
+        ],
+      },
+      target: {
+        ...emptyTarget,
+        contacts: new Map([
+          ["steve.wozniak@gmail.com", there("Steve", "Wozniak")],
+          ["grace.hopper@example.com", there("Grace", "Hopper")],
+        ]),
+      },
+      options: options({ include: new Set<Resource>(["contacts", "segments"]) }),
+    });
+    expect(
+      withSegment.items.filter((i) => i.resource === "contacts").map((i) => [i.action, i.count]),
+    ).toEqual([
+      ["create", 3],
+      ["update", 1],
+      ["unchanged", 1],
+    ]);
+  });
+
+  it("an opt-out on the target is no difference: the source cannot clear it", () => {
+    const p = plan([["ada.lovelace@example.com", there("Ada", "Lovelace", true)]]);
+    expect(contactItems(p)).toContainEqual(["unchanged", "existing contacts", 1]);
+  });
+
+  it("everyone there and nothing differs: no create at all", () => {
+    const p = plan(
+      [
+        ["steve.wozniak@gmail.com", there("Steve", "Wozniak")],
+        ["grace.hopper@example.com", there("Grace", "Hopper")],
+        ["ada.lovelace@example.com", there("Ada", "Lovelace", true)],
+        ["alan.turing@example.com", there(null, null)],
+        ["linus@example.net", there("Linus", null)],
+      ],
+      {},
+    );
+    expect(contactItems(p)).toEqual([["unchanged", "existing contacts", 5]]);
+    expect(p.counts.create).toBe(0);
+  });
+
+  it("--on-conflict skip and error say what happens to the ones already there", () => {
+    const rows: [string, TargetContact][] = [["steve.wozniak@gmail.com", there("S", null)]];
+    const skip = plan(rows, { onConflict: "skip" });
+    expect(skip.items.at(-1)).toMatchObject({
+      action: "skip",
+      count: 1,
+      detail: expect.stringContaining("--on-conflict skip leaves them as they are"),
+    });
+    const error = plan(rows, { onConflict: "error" });
+    // The run still goes through them, so the API refuses each and the run exits 3.
+    expect(error.items.at(-1)).toMatchObject({
+      action: "update",
+      detail: expect.stringContaining("--on-conflict error refuses them"),
+    });
+  });
+
+  it("only the new contacts count against the plan's contact cap", () => {
+    const limited = {
+      usage: {
+        ...emptyTarget.usage,
+        plan: "free",
+        limits: { ...emptyTarget.usage.limits, contacts: 3 },
+      },
+    };
+    expect(plan([], {}, limited).warnings).toEqual([
+      "5 contacts to create; the Free plan allows 3",
+    ]);
+    const mostlyThere: [string, TargetContact][] = [
+      "steve.wozniak@gmail.com",
+      "grace.hopper@example.com",
+      "ada.lovelace@example.com",
+    ].map((email) => [email, there(null, null)]);
+    expect(plan(mostlyThere, {}, limited).warnings).toEqual([]);
   });
 });

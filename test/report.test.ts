@@ -160,6 +160,19 @@ describe("printSummary layout", () => {
     expect(lines.some((l) => l.startsWith("  ✗ contacts/mary jane@example.com — "))).toBe(true);
   });
 
+  it("keeps a long address with no space whole on one line, behind its symbol", async () => {
+    setColorMode("never");
+    const key = `${"a".repeat(90)}.example.com`;
+    const text = await summary({
+      ...report,
+      checklist: { done: [], left: [] },
+      failures: [{ resource: "contacts", key, message: "Invalid email address", statusCode: 422 }],
+    });
+    const lines = text.split("\n").filter((l) => l.includes(key));
+    expect(lines).toEqual([`  ✗ contacts/${key}`]);
+    expect(text).toContain(`  ✗ contacts/${key}\n    — Invalid email address\n`);
+  });
+
   it("counts matched contacts and the property values that were not written", async () => {
     setColorMode("never");
     const text = await summary({

@@ -1173,6 +1173,30 @@ export async function startContractApi(
       }
       return { data, counts, ...(strict ? {} : { errors }) };
     },
+    "POST /contacts/batch/get": ({ body }: { body: AnyBody }) => {
+      const refs = body.contacts as { id?: string; email?: string }[];
+      const data: unknown[] = [];
+      const missing: unknown[] = [];
+      for (const [index, ref] of refs.entries()) {
+        const row = [...store.contacts.values()].find((c) =>
+          ref.id !== undefined
+            ? c.id === ref.id
+            : c.email.toLowerCase() === ref.email?.toLowerCase(),
+        );
+        if (row) {
+          data.push({
+            object: "contact",
+            ...contactItem(row),
+            ...(body.include?.includes("topics") ? { topics: contactTopics(row.id) } : {}),
+          });
+        } else
+          missing.push({
+            index,
+            ...(ref.id === undefined ? { email: ref.email } : { id: ref.id }),
+          });
+      }
+      return { object: "list", data, missing };
+    },
     "GET /contacts/{id}": ({ params }) => {
       const c = store.contacts.get(params.id ?? "") ?? notFound("Contact");
       const properties: Record<string, { type: string; value: string | number }> = {};

@@ -174,7 +174,14 @@ export async function prepare(
   });
   snapshot.metrics = await source.readMetrics();
   const step = ctx.progress.step("BillionSend");
-  const targetState = await target.readState();
+  let targetState = await target.readState();
+  // Which of the source's contacts the target has already, so the plan counts new and existing apart.
+  if (include.has("contacts") && snapshot.contacts.length > 0) {
+    targetState = {
+      ...targetState,
+      contacts: await target.findContacts(snapshot.contacts.map((c) => c.email)),
+    };
+  }
   step.done("current state read");
   const chosen =
     !pick || config.nonInteractive || config.only !== null || config.skip.length > 0
@@ -254,9 +261,11 @@ export function idleOutcome(plan: Plan, state: MigrateState): ApplyOutcome {
       failed: 0,
     };
     counts[item.resource] = c;
-    if (item.action === "unchanged") c.unchanged += 1;
-    else if (item.action === "manual") c.manual += 1;
-    else if (item.action === "skip") c.skipped += 1;
+    // An aggregate item (the contacts already there) stands for `count` rows.
+    const rows = item.count ?? 1;
+    if (item.action === "unchanged") c.unchanged += rows;
+    else if (item.action === "manual") c.manual += rows;
+    else if (item.action === "skip") c.skipped += rows;
   }
   return {
     state,

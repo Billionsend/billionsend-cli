@@ -377,8 +377,13 @@ describe("billionsend (built bundle)", () => {
       expect(stdout).toContain("steps done — left:");
       expect(stdout).toContain("[ ] add DNS records for news.example.com");
       expect(stdout).toContain("[ ] add DNS records for updates.example.com");
-      expect(stdout.replace(/\s+/g, " ")).toContain(
-        "[ ] set RESEND_BASE_URL=https://api.billionsend.com in your app, so Resend SDK calls go to BillionSend",
+      expect(stdout).toContain(
+        [
+          "  [ ] set RESEND_BASE_URL=https://api.billionsend.com in your app, so Resend SDK",
+          `      calls go to BillionSend (this run used ${cloud.baseUrl}; put that`,
+          "      address there only if your app reaches BillionSend through it)",
+          "",
+        ].join("\n"),
       );
       expect(stdout).toContain(`[ ] create API keys: ${API_KEY_NAMES.join(", ")}`);
       expect(stdout).toContain(

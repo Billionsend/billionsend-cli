@@ -222,8 +222,20 @@ export interface TargetBroadcast {
   status: string;
 }
 
+/** A contact already on the target, as far as the plan compares it with the source. */
+export interface TargetContact {
+  firstName: string | null;
+  lastName: string | null;
+  unsubscribed: boolean;
+}
+
 /** What the target already has — the plan diffs the Snapshot against this. */
 export interface TargetState {
+  /**
+   * The source's contacts that are already on the target, by lowercased address.
+   * Empty until `findContacts` has looked the source's addresses up.
+   */
+  contacts: ReadonlyMap<string, TargetContact>;
   /** At least one contact exists on the target; enrichment can run without a contacts pass. */
   hasContacts?: boolean | undefined;
   usage: TargetUsage;

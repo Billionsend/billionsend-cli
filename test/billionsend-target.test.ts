@@ -357,6 +357,84 @@ describe("writers", () => {
     ]);
   });
 
+  it("looks contacts up by address: case-insensitively, each once, leaving a malformed address out of the request", async () => {
+    const before = target.requests;
+    const found = await target.findContacts([
+      "ADA@example.com",
+      "ada@example.com",
+      "nobody@example.com",
+      "not-an-email",
+      "bob@example.com",
+    ]);
+    // One request for all of them: the malformed address would have made the API refuse the whole batch.
+    expect(target.requests - before).toBe(1);
+    expect([...found.keys()].sort()).toEqual(["ada@example.com", "bob@example.com"]);
+    expect(found.get("ada@example.com")).toEqual({
+      firstName: "Ada",
+      lastName: null,
+      unsubscribed: false,
+    });
+    expect(found.get("bob@example.com")).toEqual({
+      firstName: null,
+      lastName: "B",
+      unsubscribed: true,
+    });
+  });
+
+  it("looks up at most 1000 addresses a request, and splits a request the API still refuses until the bad address is alone", async () => {
+    const asked: number[] = [];
+    const answer: typeof fetch = async (_url, init) => {
+      const contacts = (JSON.parse(String(init?.body)) as { contacts: { email: string }[] })
+        .contacts;
+      asked.push(contacts.length);
+      if (contacts.some((c) => c.email === "refused@example.com")) {
+        return new Response(JSON.stringify({ name: "validation_error", message: "email" }), {
+          status: 422,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          object: "list",
+          data: contacts
+            .filter((c) => c.email.startsWith("known"))
+            .map((c) => ({
+              email: c.email,
+              first_name: null,
+              last_name: null,
+              unsubscribed: false,
+            })),
+          missing: [],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    const stub = createBillionSendTarget(
+      createHttp({
+        baseUrl: "https://api.example.test",
+        token: "bs_test",
+        userAgent: "billionsend-cli/test",
+        rps: 1000,
+        name: "BillionSend",
+        log,
+        fetch: answer,
+      }),
+      log,
+    );
+    const emails = Array.from(
+      { length: 2500 },
+      (_, i) => `${i % 2 === 0 ? "known" : "other"}${i}@example.com`,
+    );
+    emails[1200] = "refused@example.com";
+    const found = await stub.findContacts(emails);
+    // 1000 + 1000 + 500 addresses; the middle request is refused and halved down to the one address.
+    expect(asked.slice(0, 3)).toEqual([1000, 1000, 500]);
+    expect(asked).toContain(1);
+    expect(asked.at(-1)).toBe(500);
+    expect(found.size).toBe(1250 - 1);
+    expect(found.has("known1200@example.com")).toBe(false);
+  });
+
   it("splits contacts into chunks of 1000 with indices over the whole input", async () => {
     const many = Array.from({ length: BATCH_MAX + 2 }, (_, i) => ({
       email: i === BATCH_MAX + 1 ? "broken" : `bulk-${i}@example.com`,

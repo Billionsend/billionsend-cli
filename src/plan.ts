@@ -6,6 +6,8 @@ import type {
   PlanOptionsRecord,
   Resource,
   Snapshot,
+  SourceContact,
+  TargetContact,
   TargetState,
   TargetWebhook,
 } from "./model.js";
@@ -80,6 +82,13 @@ export interface WebhookPayload {
 }
 export type TemplatePayload = TemplateCreateInput;
 /** segment_id/topic_id are filled at apply time by name, once those rows exist. */
+/** Whether upserting the source contact would change the target's: a name it has that the target lacks or spells differently, or an opt-out the target does not have. */
+function contactDiffers(source: SourceContact, target: TargetContact): boolean {
+  if (source.unsubscribed && !target.unsubscribed) return true;
+  if (source.firstName !== null && source.firstName !== target.firstName) return true;
+  return source.lastName !== null && source.lastName !== target.lastName;
+}
+
 export interface BroadcastPayload {
   input: BroadcastCreateInput;
   segmentName: string | null;
@@ -368,16 +377,70 @@ export function buildPlan({
     const memberships = has("segments")
       ? snapshot.segments.reduce((n, s) => n + s.memberEmails.length, 0)
       : 0;
-    add("contacts", "create", "contacts", {
-      count: contactCount,
-      detail: `batch upsert, ${pluralize(memberships, "segment membership")}`,
-    });
-    // The target's own count is not on the wire; the source alone exceeding
-    // the cap is already a sure overflow (upserts of existing rows aside).
+    // The batch endpoint upserts by address: the contacts the target already has are matched, not created.
+    const members = new Set<string>();
+    if (has("segments")) {
+      for (const segment of snapshot.segments) {
+        for (const email of segment.memberEmails) members.add(email.toLowerCase());
+      }
+    }
+    const fresh: SourceContact[] = [];
+    const matched = { changed: 0, same: 0 };
+    for (const c of snapshot.contacts) {
+      const there = target.contacts.get(c.email.toLowerCase());
+      if (there === undefined) fresh.push(c);
+      // A segment's members on the target are not read: a contact in one is upserted to make sure it is there.
+      else if (contactDiffers(c, there) || members.has(c.email.toLowerCase())) matched.changed += 1;
+      else matched.same += 1;
+    }
+    const existing = matched.changed + matched.same;
+    const batchDetail = `batch upsert, ${pluralize(memberships, "segment membership")}`;
+    if (fresh.length > 0 || existing === 0) {
+      add("contacts", "create", "contacts", {
+        count: fresh.length,
+        detail:
+          existing === 0
+            ? batchDetail
+            : `${formatNumber(fresh.length)} not on BillionSend yet; batch upsert, ${pluralize(memberships, "segment membership")} across all ${formatNumber(contactCount)} contacts`,
+      });
+    }
+    if (existing > 0) {
+      const there = (n: number, what: string): string =>
+        `${formatNumber(n)} already on BillionSend (matched by address); ${what}`;
+      if (options.onConflict === "skip") {
+        add("contacts", "skip", "existing contacts", {
+          count: existing,
+          detail: there(existing, "--on-conflict skip leaves them as they are"),
+        });
+      } else if (options.onConflict === "error") {
+        // The run still goes through them: the API refuses each one, and the run exits 3.
+        add("contacts", "update", "existing contacts", {
+          count: existing,
+          detail: there(existing, "--on-conflict error refuses them, and the run exits 3"),
+        });
+      } else {
+        if (matched.changed > 0) {
+          add("contacts", "update", "existing contacts", {
+            count: matched.changed,
+            detail: there(
+              matched.changed,
+              "the upsert makes sure each is in its segment and writes a name or opt-out flag that differs",
+            ),
+          });
+        }
+        if (matched.same > 0) {
+          add("contacts", "unchanged", "existing contacts", {
+            count: matched.same,
+            detail: there(matched.same, "names and opt-out flag are the same, in no segment"),
+          });
+        }
+      }
+    }
+    // Only the contacts that are new count against the plan's cap; the existing ones are already counted.
     const limit = target.usage.limits.contacts;
-    if (limit !== null && contactCount > limit) {
+    if (limit !== null && fresh.length > limit) {
       warnings.push(
-        `${pluralize(contactCount, "contact")} to create; the ${capitalize(target.usage.plan ?? "current")} plan allows ${formatNumber(limit)}`,
+        `${pluralize(fresh.length, "contact")} to create; the ${capitalize(target.usage.plan ?? "current")} plan allows ${formatNumber(limit)}`,
       );
     }
   }
@@ -482,7 +545,8 @@ export function buildPlan({
   ).length;
   const writes =
     rowWrites +
-    batches(contactCount) +
+    // The lookup of the source's addresses on the target, then the upsert itself.
+    batches(contactCount) * 2 +
     batches(suppressionCount) +
     (enrichment ? facets.length * batches(enrichCount) : 0);
   // The whole run, as `apply` does it (it reads the source again): every source request, spent or
@@ -630,10 +694,11 @@ export function groupPlanItems(items: readonly PlanItem[]): PlanGroup[] {
         });
       }
     }
-    const count = own[0]?.count;
+    const counted = own.filter((i) => i.count !== undefined);
+    const count = counted.reduce((n, i) => n + (i.count ?? 0), 0);
     groups.push({
       resource,
-      label: count === undefined ? resource : `${resource} (${formatNumber(count)})`,
+      label: counted.length === 0 ? resource : `${resource} (${formatNumber(count)})`,
       rows,
     });
   }

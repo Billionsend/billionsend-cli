@@ -30,7 +30,7 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm lint
       - run: pnpm build
-      - run: pnpm test
+      - run: pnpm test:coverage
 
   bundle-node18:
     name: the bundle runs on Node 18
