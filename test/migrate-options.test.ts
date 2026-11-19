@@ -206,7 +206,7 @@ describe("plan files record their options", () => {
       ]);
       expect(planned.code).toBe(2);
       const saved = JSON.parse(readFileSync(file, "utf8")) as Plan;
-      expect(saved.version).toBe(2);
+      expect(saved.version).toBe(3);
       expect(saved.options).toEqual({
         only: ["segments", "contacts"],
         skip: [],

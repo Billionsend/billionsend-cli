@@ -273,7 +273,7 @@ export interface PlanOptionsRecord {
 }
 
 export interface Plan {
-  version: 2;
+  version: 3;
   createdAt: string;
   source: ProviderId;
   target: { baseUrl: string; plan: string | null };

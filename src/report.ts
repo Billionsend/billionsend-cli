@@ -14,9 +14,10 @@ import {
   type TargetUsage,
 } from "./model.js";
 import { type MigratePaths, writePrivate, writePrivateJson } from "./paths.js";
-import { foldedKeysLine, groupPlanItems, scopeLine } from "./plan.js";
+import { type DomainPayload, foldedKeysLine, groupPlanItems, scopeLine } from "./plan.js";
 import { countUp } from "./progress.js";
 import { bold, dim, err, heading, info, note, SYM, shortId, wrapIndent } from "./theme.js";
+import { returnPathNote } from "./translate.js";
 import {
   capitalize,
   formatDuration,
@@ -59,7 +60,7 @@ export interface Report {
   freshWebhookSecrets: { endpoint: string; secret: string }[];
   checklist: { done: string[]; left: string[] };
   /** Our DNS records per domain that still needs them. */
-  dns: { domain: string; records: DnsRecord[] }[];
+  dns: { domain: string; records: DnsRecord[]; note: string | null }[];
   apiKeys: string[];
   /** Source id → target id for topics and segments, the resources code refers to by id. */
   ids: IdMapping[];
@@ -194,11 +195,12 @@ export function buildReport({
   const dns = Object.entries(outcome.domainRecords).map(([domain, records]) => ({
     domain,
     records,
+    note: domainReturnPathNote(plan, domain),
   }));
   for (const domain of targetState.domains) {
     if (domain.status === "verified" || domain.name in outcome.domainRecords) continue;
     if (!snapshot.domains.some((d) => d.name === domain.name)) continue;
-    dns.push({ domain: domain.name, records: domain.records });
+    dns.push({ domain: domain.name, records: domain.records, note: null });
   }
   const apiKeys = plan.items.filter((i) => i.resource === "api-keys").map((i) => i.key);
   const manual = [
@@ -268,6 +270,17 @@ export function baseUrlStep(source: ProviderId, baseUrl: string): string {
     : `${step} (this run used ${baseUrl}; put that address there only if your app reaches BillionSend through it)`;
 }
 
+/** What the plan said about a created domain's return path, or null when it created none. */
+export function domainReturnPathNote(plan: Plan, domain: string): string | null {
+  const item = plan.items.find(
+    (i) => i.resource === "domains" && i.action === "create" && i.key === domain,
+  );
+  const payload = item?.payload as DomainPayload | undefined;
+  return payload?.create.custom_return_path === undefined
+    ? null
+    : returnPathNote(payload.create.custom_return_path, payload.sourceReturnPath);
+}
+
 /** One card per record: type and name, then the whole value on its own line (a DKIM key wraps as a block, never cut). */
 export function dnsCards(records: DnsRecord[]): string[] {
   return records.flatMap((r, i) => [
@@ -285,6 +298,7 @@ export function cutoverReadyLines(
   source: ProviderId,
   baseUrl: string,
   domainRecords: Record<string, DnsRecord[]>,
+  plan: Plan,
 ): string[] {
   const lines = [
     "",
@@ -297,7 +311,13 @@ export function cutoverReadyLines(
     }),
   ];
   for (const [domain, records] of Object.entries(domainRecords)) {
-    lines.push("", `DNS records for ${domain}:`, ...dnsCards(records));
+    const note = domainReturnPathNote(plan, domain);
+    lines.push(
+      "",
+      `DNS records for ${domain}:`,
+      ...(note === null ? [] : [dim(`${note}.`)]),
+      ...dnsCards(records),
+    );
   }
   return lines;
 }
@@ -402,8 +422,9 @@ export async function printSummary(out: OutStream, raw: Report): Promise<void> {
   out.write(`\n${bold(String(done.length))} of ${done.length + left.length} steps done — left:\n`);
   for (const item of left)
     line(`${dim("[")} ${dim("]")} ${item}`, { indent: "  ", hanging: "      " });
-  for (const { domain, records } of report.dns) {
+  for (const { domain, records, note } of report.dns) {
     out.write(`\nDNS records for ${domain}:\n`);
+    if (note !== null) out.write(`${dim(`${note}.`)}\n`);
     for (const card of dnsCards(records)) out.write(`${card}\n`);
   }
   if (report.ids.length > 0) {
@@ -456,11 +477,12 @@ export function renderReportMd(raw: Report): string {
     ...report.checklist.done.map((step) => `- [x] ${step}`),
     ...report.checklist.left.map((step) => `- [ ] ${step}`),
   ];
-  for (const { domain, records } of report.dns) {
+  for (const { domain, records, note } of report.dns) {
     lines.push(
       "",
       `### DNS records for ${domain}`,
       "",
+      ...(note === null ? [] : [`${note}.`, ""]),
       "| Type | Name | Priority | Value |",
       "| --- | --- | --- | --- |",
       ...records.map((r) => `| ${r.type} | ${r.name} | ${r.priority ?? ""} | \`${r.value}\` |`),
@@ -540,6 +562,17 @@ export function renderPlanMd(raw: Plan, sourceLabel: string): string {
     "",
     `About ${formatNumber(plan.estimate.requests)} requests (${formatDuration(plan.estimate.seconds)} at ${plan.rps} req/s).`,
   ];
+  const returnPaths = plan.items.filter(
+    (i) => i.resource === "domains" && i.action === "create" && i.detail !== undefined,
+  );
+  if (returnPaths.length > 0) {
+    lines.push(
+      "",
+      "## Return paths",
+      "",
+      ...returnPaths.map(({ key, detail }) => `- ${key} — ${detail}`),
+    );
+  }
   if (plan.warnings.length > 0) {
     lines.push("", "## Warnings", "", ...plan.warnings.map((w) => `- ${w}`));
   }

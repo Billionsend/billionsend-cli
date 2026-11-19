@@ -153,6 +153,8 @@ export interface ContractApi {
   violations: string[];
   /** Every (METHOD, template) this instance served, for the coverage test. */
   served: Set<string>;
+  /** The JSON body of each request as it arrived, with the `METHOD template` it matched. */
+  bodies: { operation: string; body: unknown }[];
   createApiKey(permission?: Permission): string;
   /** The number of rows in one store table; topic subscriptions count one per (contact, topic). */
   count(table: keyof Store): number;
@@ -263,6 +265,7 @@ export async function startContractApi(
   };
   const violations: string[] = [];
   const served = new Set<string>();
+  const bodies: { operation: string; body: unknown }[] = [];
 
   // A strictly increasing clock: list order and "oldest first" must not hinge on two rows sharing a millisecond.
   let tick = Date.parse("2026-01-01T00:00:00.000Z");
@@ -1346,6 +1349,8 @@ export async function startContractApi(
         }
       }
 
+      bodies.push({ operation: key, body });
+
       const security = matched.operation.security;
       if (!(Array.isArray(security) && security.length === 0)) {
         const auth = headers.authorization ?? "";
@@ -1412,6 +1417,7 @@ export async function startContractApi(
     store,
     violations,
     served,
+    bodies,
     createApiKey: mintKey,
     count: (table) =>
       table === "topicSubscriptions"

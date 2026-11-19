@@ -497,3 +497,149 @@ describe("a failure list that keeps an address whole (built bundle)", () => {
     SLOW,
   );
 });
+
+describe("the return path of a migrated domain (built bundle)", () => {
+  type Row = Record<string, unknown>;
+  const NOTE = (target: string, source: string) =>
+    `BillionSend return path is \`${target}\`; Resend's \`${source}\` stays as it is, so both can run in parallel`;
+
+  /** The POST /domains bodies the target received, by domain name. */
+  const createdBodies = (): Record<string, unknown>[] =>
+    api.bodies
+      .filter((b) => b.operation === "POST /domains")
+      .map((b) => b.body as Record<string, unknown>);
+  const returnPathOf = (name: string): string | undefined =>
+    [...api.store.domains.values()].find((d) => d.name === name)?.customReturnPath;
+
+  /** Plan to a file, apply that file; both write their Markdown report. */
+  async function planAndApply(): Promise<{ plan: Plan; planMd: string; planOut: string }> {
+    const file = join(cwd, "plan.json");
+    const planned = await cli([
+      "migrate",
+      "plan",
+      "--from",
+      "resend",
+      "--only",
+      "domains",
+      "--out",
+      file,
+      "--report",
+      join(cwd, "plan.md"),
+    ]);
+    expect(planned.stderr).toBe("");
+    expect(planned.code).toBe(2);
+    const applied = await cli(["migrate", "apply", file, "--yes", "--rps", "10"]);
+    expect(applied.stderr).toBe("");
+    expect(applied.code).toBe(0);
+    return {
+      plan: JSON.parse(readFileSync(file, "utf8")) as Plan,
+      planMd: readFileSync(join(cwd, "plan.md"), "utf8"),
+      planOut: planned.stdout,
+    };
+  }
+
+  const payload = (plan: Plan, name: string) =>
+    plan.items.find((i) => i.resource === "domains" && i.action === "create" && i.key === name)
+      ?.payload;
+
+  it(
+    "Resend on send or mail: BillionSend gets bounce, the plan and the report say Resend's label stays",
+    async () => {
+      // The fixture's example.com has its return path at send, news.example.com at mail.
+      await boot();
+      const { plan, planMd, planOut } = await planAndApply();
+
+      expect(payload(plan, "example.com")).toMatchObject({
+        create: { name: "example.com", custom_return_path: "bounce" },
+        sourceReturnPath: "send",
+      });
+      expect(payload(plan, "news.example.com")).toMatchObject({
+        create: { name: "news.example.com", custom_return_path: "bounce" },
+        sourceReturnPath: "mail",
+      });
+      expect(planOut).toContain("BillionSend return path is `bounce`");
+      expect(planMd).toContain(`- example.com — ${NOTE("bounce", "send")}`);
+      expect(planMd).toContain(`- news.example.com — ${NOTE("bounce", "mail")}`);
+
+      // The request bodies name the label; the target's own default is never relied on.
+      const bodies = createdBodies();
+      expect(bodies.map((b) => [b.name, b.custom_return_path])).toEqual([
+        ["example.com", "bounce"],
+        ["news.example.com", "bounce"],
+      ]);
+      expect(returnPathOf("example.com")).toBe("bounce");
+      expect(returnPathOf("news.example.com")).toBe("bounce");
+
+      // The report's DNS table is the new host; Resend's send.example.com is nowhere in it.
+      const md = readFileSync(migratePaths(cwd).reportMd, "utf8");
+      expect(md).toContain("### DNS records for example.com");
+      expect(md).toContain(`${NOTE("bounce", "send")}.`);
+      expect(md).toContain(`${NOTE("bounce", "mail")}.`);
+      expect(md).toContain("| MX | bounce.example.com |");
+      expect(md).toContain("| TXT | bounce.example.com |");
+      expect(md).toContain("| MX | bounce.news.example.com |");
+      expect(md).not.toMatch(/\| (MX|TXT) \| send\.example\.com \|/);
+      const dns = report().dns;
+      expect(dns.map((d) => [d.domain, d.note])).toEqual([
+        ["example.com", NOTE("bounce", "send")],
+        ["news.example.com", NOTE("bounce", "mail")],
+      ]);
+    },
+    SLOW,
+  );
+
+  it(
+    "Resend already on bounce: BillionSend gets the fixed fallback bounces, never the same label",
+    async () => {
+      const data = account();
+      for (const row of data.domains as Row[]) {
+        if (row.name !== "news.example.com") continue;
+        row.records = (row.records as Row[]).map((r) =>
+          r.record === "SPF" ? { ...r, name: "bounce.news" } : r,
+        );
+      }
+      await boot(data);
+      const { plan, planMd } = await planAndApply();
+
+      expect(payload(plan, "news.example.com")).toMatchObject({
+        create: { name: "news.example.com", custom_return_path: "bounces" },
+        sourceReturnPath: "bounce",
+      });
+      // The other domain is still on send, so it takes bounce.
+      expect(payload(plan, "example.com")).toMatchObject({
+        create: { custom_return_path: "bounce" },
+        sourceReturnPath: "send",
+      });
+      expect(planMd).toContain(`- news.example.com — ${NOTE("bounces", "bounce")}`);
+
+      expect(createdBodies().map((b) => [b.name, b.custom_return_path])).toEqual([
+        ["example.com", "bounce"],
+        ["news.example.com", "bounces"],
+      ]);
+      expect(returnPathOf("news.example.com")).toBe("bounces");
+
+      const md = readFileSync(migratePaths(cwd).reportMd, "utf8");
+      expect(md).toContain(`${NOTE("bounces", "bounce")}.`);
+      expect(md).toContain("| MX | bounces.news.example.com |");
+      expect(md).not.toContain("| MX | bounce.news.example.com |");
+    },
+    SLOW,
+  );
+
+  it(
+    "a domain already on BillionSend is left as it is: no create, no return-path note",
+    async () => {
+      await boot();
+      await post("/domains", { name: "example.com", custom_return_path: "mail" });
+      const { plan, planMd } = await planAndApply();
+      expect(plan.items.find((i) => i.key === "example.com")).toMatchObject({
+        action: "unchanged",
+      });
+      expect(createdBodies().map((b) => b.name)).toEqual(["example.com", "news.example.com"]);
+      expect(returnPathOf("example.com")).toBe("mail");
+      expect(planMd).not.toContain("- example.com — BillionSend return path");
+      expect(planMd).toContain("- news.example.com — BillionSend return path");
+    },
+    SLOW,
+  );
+});

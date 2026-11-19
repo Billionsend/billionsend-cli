@@ -115,9 +115,11 @@ segments
   + Imported  0 members
 domains
   = example.com
-  + updates.example.com
+  + updates.example.com  BillionSend return path is \`bounce\`; Resend's \`bounces\`
+    stays as it is, so both can run in parallel
   ! updates.example.com  add DNS records (shown after apply)
-  + mail.example.org
+  + mail.example.org  BillionSend return path is \`bounce\`; Resend's \`send\` stays
+    as it is, so both can run in parallel
   ! mail.example.org  add DNS records (shown after apply)
 webhooks
   ~ https://webhook.example.com/handler  events
@@ -169,7 +171,7 @@ describe("buildPlan + renderPlan (golden)", () => {
   it("counts, header and manual list agree with the items", () => {
     expect(plan.counts).toEqual({ create: 11, update: 5, unchanged: 2, manual: 7, skip: 1 });
     expect(plan).toMatchObject({
-      version: 2,
+      version: 3,
       createdAt: "2026-09-01T12:00:00.000Z",
       source: "resend",
       target: { baseUrl: "https://api.billionsend.com", plan: "free" },
@@ -220,8 +222,9 @@ describe("buildPlan + renderPlan (golden)", () => {
     });
     expect(byKey("segments", "Enterprise")?.payload).toEqual({ name: "Enterprise" });
     expect(byKey("domains", "updates.example.com")?.payload).toEqual({
-      create: { name: "updates.example.com", custom_return_path: "bounces" },
+      create: { name: "updates.example.com", custom_return_path: "bounce" },
       tracking: { open_tracking: false, click_tracking: true, tracking_subdomain: "track" },
+      sourceReturnPath: "bounces",
     });
     expect(byKey("webhooks", "https://webhook.example.com/handler", "update")?.payload).toEqual({
       events: ["email.sent", "email.delivered", "email.bounced"],
@@ -536,9 +539,17 @@ describe("buildPlan diffs against existing rows", () => {
     expect(plan.items.map((i) => [i.action, i.key, i.detail])).toEqual([
       ["unchanged", "example.com", undefined],
       ["manual", "example.com", "add 3 DNS records"],
-      ["create", "updates.example.com", undefined],
+      [
+        "create",
+        "updates.example.com",
+        "BillionSend return path is `bounce`; Resend's `bounces` stays as it is, so both can run in parallel",
+      ],
       ["manual", "updates.example.com", "add DNS records (shown after apply)"],
-      ["create", "mail.example.org", undefined],
+      [
+        "create",
+        "mail.example.org",
+        "BillionSend return path is `bounce`; Resend's `send` stays as it is, so both can run in parallel",
+      ],
       ["manual", "mail.example.org", "add DNS records (shown after apply)"],
     ]);
     expect(plan.warnings).toEqual(["2 domains to create; the Pro plan allows 2 (1 already there)"]);
@@ -660,9 +671,10 @@ describe("planHash / serializePlan / parsePlan", () => {
     ["{", "plan file is not valid JSON"],
     ["null", "plan file is not a migration plan"],
     ['{"version":1}', "plan file is not a migration plan"],
-    ['{"version":1,"items":[]}', "plan file version 1 is not supported (expected 2)"],
-    ['{"items":[]}', "plan file version undefined is not supported (expected 2)"],
-    ['{"version":2,"items":[]}', "plan file is not a migration plan"],
+    ['{"version":1,"items":[]}', "plan file version 1 is not supported (expected 3)"],
+    ['{"items":[]}', "plan file version undefined is not supported (expected 3)"],
+    ['{"version":2,"items":[]}', "plan file version 2 is not supported (expected 3)"],
+    ['{"version":3,"items":[]}', "plan file is not a migration plan"],
   ])("rejects %s", (text, message) => {
     expect(() => parsePlan(text)).toThrow(message);
   });

@@ -19,6 +19,7 @@ import {
   type DomainCreateInput,
   type DomainTrackingInput,
   domainCreateInput,
+  returnPathNote,
   type SegmentFilter,
   type TargetWebhookEvent,
   type TemplateCreateInput,
@@ -36,7 +37,7 @@ import {
   stripControl,
 } from "./utils.js";
 
-export const PLAN_VERSION = 2;
+export const PLAN_VERSION = 3;
 const BATCH_SIZE = 1000;
 
 /** Item order: each resource only references ones created before it. */
@@ -72,6 +73,8 @@ export interface SegmentPayload {
 export interface DomainPayload {
   create: DomainCreateInput;
   tracking: DomainTrackingInput;
+  /** The domain's return-path label on the source, which BillionSend must not reuse. */
+  sourceReturnPath: string;
 }
 /** Secrets never enter the plan: apply reads the source secret by `sourceId`. */
 export interface WebhookPayload {
@@ -250,10 +253,11 @@ export function buildPlan({
         }
         continue;
       }
-      const { input, tracking } = domainCreateInput(d);
+      const { input, tracking, sourceReturnPath } = domainCreateInput(d);
       creates += 1;
-      const payload: DomainPayload = { create: input, tracking };
-      add("domains", "create", d.name, { payload });
+      const payload: DomainPayload = { create: input, tracking, sourceReturnPath };
+      const note = returnPathNote(input.custom_return_path ?? "", sourceReturnPath);
+      add("domains", "create", d.name, { payload, detail: note });
       manual("domains", d.name, DNS_AFTER_APPLY);
     }
     const limit = target.usage.limits.domains;
@@ -557,7 +561,7 @@ export function buildPlan({
   const seconds = Math.ceil(reads / options.rps + writes / 10);
 
   return {
-    version: 2,
+    version: PLAN_VERSION,
     createdAt: (options.now ?? new Date()).toISOString(),
     source: snapshot.provider,
     target: {

@@ -535,7 +535,7 @@ export async function applyPlan(input: ApplyInput): Promise<ApplyOutcome> {
       const leftOut = CUTOVER_RESOURCES.filter((r) => input.include?.has(r) === false);
       const lines =
         leftOut.length === 0
-          ? cutoverReadyLines(plan.source, plan.target.baseUrl, outcome.domainRecords)
+          ? cutoverReadyLines(plan.source, plan.target.baseUrl, outcome.domainRecords, plan)
           : [
               "",
               dim(

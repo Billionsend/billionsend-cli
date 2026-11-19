@@ -339,7 +339,7 @@ describe("billionsend migrate", () => {
         ].join("\n"),
       );
       const plan = JSON.parse(readFileSync(out, "utf8")) as Plan;
-      expect(plan.version).toBe(2);
+      expect(plan.version).toBe(3);
       expect(plan.target.baseUrl).toBe(api.baseUrl);
       expect(JSON.stringify(plan)).not.toContain("whsec_");
 

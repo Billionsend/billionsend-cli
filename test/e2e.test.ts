@@ -191,7 +191,7 @@ describe("billionsend (built bundle)", () => {
       const { code, stdout, stderr } = await run(["migrate", "plan", "--from", "resend", "--json"]);
       expect(code).toBe(2);
       const plan = JSON.parse(stdout) as Plan;
-      expect(plan.version).toBe(2);
+      expect(plan.version).toBe(3);
       expect(plan.target).toEqual({ baseUrl: cloud.baseUrl, plan: "pro" });
       expect(plan.counts).toEqual({ create: 23, update: 2, unchanged: 1, manual: 9, skip: 3 });
       expect(stderr).toMatch(new RegExp(`✓ Contacts\\s+${CONTACT_COUNT.toLocaleString("en-US")}`));
@@ -215,7 +215,8 @@ describe("billionsend (built bundle)", () => {
       expect(item("domains", "news.example.com")).toMatchObject({
         action: "create",
         payload: {
-          create: { name: "news.example.com", custom_return_path: "mail" },
+          create: { name: "news.example.com", custom_return_path: "bounce" },
+          sourceReturnPath: "mail",
         },
       });
       expect(item("segments", "Active Users")).toMatchObject({

@@ -4,6 +4,8 @@ import {
   broadcastCreateInput,
   domainCreateInput,
   TARGET_ALL_EVENTS,
+  TARGET_RETURN_PATH,
+  TARGET_RETURN_PATH_FALLBACK,
   templateCreateInput,
   translateMergeTags,
   translateSegmentFilter,
@@ -235,10 +237,19 @@ const domain = (overrides: Partial<SourceDomain> = {}): SourceDomain => ({
 });
 
 describe("domainCreateInput", () => {
-  it("omits custom_return_path for the default send label", () => {
+  it("gives BillionSend `bounce` when Resend uses the default send label", () => {
     expect(domainCreateInput(domain())).toEqual({
-      input: { name: "example.com" },
+      input: { name: "example.com", custom_return_path: "bounce" },
       tracking: { open_tracking: true, click_tracking: false },
+      sourceReturnPath: "send",
+    });
+  });
+
+  it("treats a domain whose label cannot be read as Resend's default send", () => {
+    const d = domain({ records: [] });
+    expect(domainCreateInput(d)).toMatchObject({
+      input: { custom_return_path: "bounce" },
+      sourceReturnPath: "send",
     });
   });
 
@@ -247,28 +258,48 @@ describe("domainCreateInput", () => {
     ["bounces.updates", "bounces"],
     ["bounces.updates.example.com", "bounces"],
     ["Bounces", "bounces"],
-  ])("takes the return-path label from the SPF record name %s", (name, expected) => {
-    const d = domain({
-      name: "updates.example.com",
-      records: [{ record: "SPF", name, type: "MX", value: "x" }],
-    });
-    expect(domainCreateInput(d).input).toEqual({
-      name: "updates.example.com",
-      custom_return_path: expected,
-    });
+    ["send.updates", "send"],
+  ])(
+    "takes Resend's return-path label from the SPF record name %s and never reuses it",
+    (name, label) => {
+      const d = domain({
+        name: "updates.example.com",
+        records: [{ record: "SPF", name, type: "MX", value: "x" }],
+      });
+      expect(domainCreateInput(d)).toMatchObject({
+        input: { name: "updates.example.com", custom_return_path: "bounce" },
+        sourceReturnPath: label,
+      });
+    },
+  );
+
+  it("uses the fixed fallback when Resend's own label is already bounce, in any case", () => {
+    for (const name of ["bounce", "Bounce.updates"]) {
+      const d = domain({ records: [{ record: "SPF", name, type: "MX", value: "x" }] });
+      expect(domainCreateInput(d)).toMatchObject({
+        input: { custom_return_path: TARGET_RETURN_PATH_FALLBACK },
+        sourceReturnPath: "bounce",
+      });
+    }
+    expect(TARGET_RETURN_PATH_FALLBACK).not.toBe(TARGET_RETURN_PATH);
   });
 
   it("prefers an explicit customReturnPath and carries the tracking subdomain", () => {
     const d = domain({ customReturnPath: "mail", trackingSubdomain: "track" });
     expect(domainCreateInput(d)).toEqual({
-      input: { name: "example.com", custom_return_path: "mail" },
+      input: { name: "example.com", custom_return_path: "bounce" },
       tracking: { open_tracking: true, click_tracking: false, tracking_subdomain: "track" },
+      sourceReturnPath: "mail",
     });
+    expect(domainCreateInput(domain({ customReturnPath: "bounce" })).input.custom_return_path).toBe(
+      "bounces",
+    );
   });
 
   it("never forwards the source region: the target provisions in the region it serves", () => {
     expect(domainCreateInput(domain({ region: "ap-south-1" })).input).toEqual({
       name: "example.com",
+      custom_return_path: "bounce",
     });
   });
 });

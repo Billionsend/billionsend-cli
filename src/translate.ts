@@ -250,35 +250,64 @@ export interface DomainTrackingInput {
   tracking_subdomain?: string;
 }
 
+/** Resend's return-path label when the domain does not name one (its DNS row is `send.<domain>`). */
+const RESEND_DEFAULT_RETURN_PATH = "send";
+
+/**
+ * The return-path label a migrated domain gets on BillionSend. It is never the
+ * one the domain has on Resend: the label is the host of an MX record that
+ * points at one provider's SES region, and moving it would break the bounces
+ * still in flight on the other while both run side by side. BillionSend fixes
+ * the label at creation (a PATCH answers 422), so it is chosen here, not left
+ * to the API's default.
+ */
+export const TARGET_RETURN_PATH = "bounce";
+/** Used only when the domain's Resend label is already `bounce`. */
+export const TARGET_RETURN_PATH_FALLBACK = "bounces";
+
+/** The label BillionSend gets for a domain whose Resend label is `source`. */
+export function targetReturnPath(source: string): string {
+  return source.toLowerCase() === TARGET_RETURN_PATH
+    ? TARGET_RETURN_PATH_FALLBACK
+    : TARGET_RETURN_PATH;
+}
+
+/** One sentence for the plan, the plan report and the migration report. */
+export const returnPathNote = (target: string, source: string): string =>
+  `BillionSend return path is \`${target}\`; Resend's \`${source}\` stays as it is, so both can run in parallel`;
+
 /**
  * Resend names the SPF/MX rows after the return-path label ("send", or
- * "bounces.updates" for updates.example.com); the target wants that first label.
+ * "send.updates" for updates.example.com); the label is the first part.
+ * Absent from the source, it is Resend's default.
  */
-function returnPathLabel(domain: SourceDomain): string | null {
+function returnPathLabel(domain: SourceDomain): string {
   if (domain.customReturnPath) return domain.customReturnPath;
   const spf = domain.records.find((r) => r.record === "SPF");
-  if (!spf) return null;
+  if (!spf) return RESEND_DEFAULT_RETURN_PATH;
   let name = spf.name.toLowerCase();
   if (name.endsWith(`.${domain.name.toLowerCase()}`)) name = name.slice(0, -domain.name.length - 1);
   const label = name.split(".")[0] ?? "";
-  return label === "" || label === domain.name.toLowerCase() ? null : label;
+  return label === "" || label === domain.name.toLowerCase() ? RESEND_DEFAULT_RETURN_PATH : label;
 }
 
 export function domainCreateInput(domain: SourceDomain): {
   input: DomainCreateInput;
   tracking: DomainTrackingInput;
+  /** The domain's return-path label on the source provider, which the target must not reuse. */
+  sourceReturnPath: string;
 } {
   const tracking: DomainTrackingInput = {
     open_tracking: domain.openTracking,
     click_tracking: domain.clickTracking,
     ...(domain.trackingSubdomain ? { tracking_subdomain: domain.trackingSubdomain } : {}),
   };
-  const label = returnPathLabel(domain);
+  const sourceReturnPath = returnPathLabel(domain).toLowerCase();
   const input: DomainCreateInput = {
     name: domain.name,
-    ...(label && label !== "send" ? { custom_return_path: label } : {}),
+    custom_return_path: targetReturnPath(sourceReturnPath),
   };
-  return { input, tracking };
+  return { input, tracking, sourceReturnPath };
 }
 
 /** A declared template variable as the API takes it (`TemplateVariableInput`). */

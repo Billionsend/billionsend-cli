@@ -35,6 +35,7 @@ const report: Report = {
       records: [
         { record: "DKIM", name: `resend._domainkey${HOSTILE}`, type: "TXT", value: HOSTILE },
       ],
+      note: null,
     },
   ],
   apiKeys: [HOSTILE],
@@ -111,6 +112,7 @@ const full: Report = {
         { record: "DKIM", name: "ms._domainkey.news.example.com", type: "TXT", value: "v=DKIM1" },
         { record: "MX", name: "news.example.com", type: "MX", value: "mx.example", priority: 10 },
       ],
+      note: null,
     },
   ],
   ids: [
