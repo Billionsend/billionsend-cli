@@ -211,6 +211,28 @@ describe("suppressions", () => {
     },
     SLOW,
   );
+
+  it(
+    "a domain entry already on the target (it has no address) is neither counted nor touched",
+    async () => {
+      api.store.suppressions.set("domain-entry", {
+        id: "domain-entry",
+        email: null,
+        domain: "blocked.example",
+        origin: "manual",
+        createdAt: "2024-01-01T00:00:00.000Z",
+      });
+      expect((await migrate("--only", "suppressions")).code).toBe(0);
+      expect(report().counts.suppressions).toMatchObject({ created: 3, unchanged: 0, failed: 0 });
+      expect(api.store.suppressions.size).toBe(4);
+      expect(api.store.suppressions.get("domain-entry")?.domain).toBe("blocked.example");
+      const again = await migrate("--only", "suppressions");
+      expect(again.code).toBe(0);
+      expect(report().counts.suppressions).toMatchObject({ created: 0, unchanged: 3, failed: 0 });
+      expect(api.store.suppressions.size).toBe(4);
+    },
+    SLOW,
+  );
 });
 
 describe("re-runs and rollback", () => {

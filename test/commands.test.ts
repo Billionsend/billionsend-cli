@@ -766,6 +766,14 @@ describe("migrate rollback", () => {
       const own = await startContractApi({ slug: "suppression-rollback" });
       const target = { BILLIONSEND_API_KEY: own.apiKey, BILLIONSEND_BASE_URL: own.baseUrl };
       try {
+        // An entry for a whole domain already on the target: no address, and none of the migration's.
+        own.store.suppressions.set("domain-entry", {
+          id: "domain-entry",
+          email: null,
+          domain: "blocked.example",
+          origin: "manual",
+          createdAt: "2024-01-01T00:00:00.000Z",
+        });
         const dir = mkdtempSync(join(tmpdir(), "billionsend-cli-rb-"));
         const migrated = await run(
           ["migrate", "--from", "resend", "--yes", "--only", "suppressions"],
@@ -795,6 +803,7 @@ describe("migrate rollback", () => {
         // The manual entry is gone; the bounce and the complaint are permanent and are said to stay.
         const left = await apiList<{ origin: string }>("/suppressions", own.apiKey, own.baseUrl);
         expect(left.map((s) => s.origin).sort()).toEqual(["bounce", "complaint"]);
+        expect(own.store.suppressions.get("domain-entry")?.domain).toBe("blocked.example");
         expect(again.stdout).toContain(
           "2 suppressions stay: a bounce or complaint entry is permanent",
         );

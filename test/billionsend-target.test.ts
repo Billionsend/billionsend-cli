@@ -213,6 +213,8 @@ describe("writers", () => {
     );
     expect(patched.id).toBe(ids.domain);
     expect(patched.records.find((r) => r.record === "Tracking")?.name).toBe("track.acme.dev");
+    // The return path is fixed at creation: the tracking patch never names it (the API answers 422 if it does).
+    expect(cloud.store.domains.get(ids.domain)?.customReturnPath).toBe("mail");
 
     expect(await target.createDomain({ name: "acme.dev" })).toEqual({
       ok: false,
@@ -224,6 +226,15 @@ describe("writers", () => {
       ok: false,
       status: 422,
     });
+  });
+
+  it("leaves the return path to the API's default, which is bounce", async () => {
+    const created = ok(await target.createDomain({ name: "default-return-path.dev" }));
+    expect(created.records.find((r) => r.record === "SPF")?.name).toBe(
+      "bounce.default-return-path.dev",
+    );
+    expect(cloud.store.domains.get(created.id)?.customReturnPath).toBe("bounce");
+    expect((await target.deleteDomain(created.id)).ok).toBe(true);
   });
 
   it("creates webhooks copying or minting the secret, updates, and 422s http endpoints", async () => {
@@ -469,11 +480,60 @@ describe("writers", () => {
     const listed = await fetch(`${cloud.baseUrl}/suppressions?origin=bounce`, {
       headers: { authorization: `Bearer ${cloud.apiKey}` },
     });
-    const body = (await listed.json()) as { data: { email: string; origin: string }[] };
+    const body = (await listed.json()) as {
+      data: {
+        email: string;
+        origin: string;
+        kind: string;
+        domain: string | null;
+        removable: boolean;
+      }[];
+    };
     expect(body.data.map((s) => s.email).sort()).toEqual([
       "bounced@example.com",
       "gone@example.com",
     ]);
+    // Address entries carry the new fields; a bounce is not removable.
+    expect(body.data.map((s) => [s.kind, s.domain, s.removable])).toEqual([
+      ["email", null, false],
+      ["email", null, false],
+    ]);
+  });
+
+  it("leaves a domain entry on the target alone: it has no address, is not listed with the addresses and is not removed with them", async () => {
+    const own = await startContractApi({ slug: "domain-suppression" });
+    try {
+      const mine = targetFor(own);
+      const added = await mine.addSuppressions(["one@example.com"], "manual");
+      const domainEntry = await fetch(`${own.baseUrl}/suppressions/batch/add`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${own.apiKey}`, "content-type": "application/json" },
+        body: JSON.stringify({ domains: ["blocked.example"] }),
+      });
+      expect(domainEntry.status).toBe(200);
+      const domainId = ((await domainEntry.json()) as { data: { id: string }[] }).data[0]?.id;
+      expect(domainId).toBeDefined();
+
+      // The ids the migration diffs against are the address entries' only.
+      expect(await mine.listSuppressionIds()).toEqual(added.ids);
+      const all = await fetch(`${own.baseUrl}/suppressions?kind=all`, {
+        headers: { authorization: `Bearer ${own.apiKey}` },
+      });
+      const rows = ((await all.json()) as { data: { email: string | null; kind: string }[] }).data;
+      expect(rows.map((r) => [r.kind, r.email]).sort()).toEqual([
+        ["domain", null],
+        ["email", "one@example.com"],
+      ]);
+
+      const removed = await mine.removeSuppressions(added.ids);
+      expect(removed.ids).toEqual(added.ids);
+      expect(removed.notRemoved).toEqual([]);
+      expect([...own.store.suppressions.values()].map((s) => s.domain)).toEqual([
+        "blocked.example",
+      ]);
+    } finally {
+      await own.stop();
+    }
   });
 });
 

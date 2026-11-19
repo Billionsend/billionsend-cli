@@ -50,6 +50,16 @@ export interface DomainRow {
   createdAt: string;
 }
 
+export interface SuppressionRow {
+  id: string;
+  /** Null on a domain entry. */
+  email: string | null;
+  /** Set on a domain entry: every address at this exact domain. */
+  domain?: string;
+  origin: "bounce" | "complaint" | "manual";
+  createdAt: string;
+}
+
 export interface Store {
   contacts: Map<string, ContactRow>;
   contactProperties: Map<
@@ -132,10 +142,7 @@ export interface Store {
       createdAt: string;
     }
   >;
-  suppressions: Map<
-    string,
-    { id: string; email: string; origin: "bounce" | "complaint" | "manual"; createdAt: string }
-  >;
+  suppressions: Map<string, SuppressionRow>;
 }
 
 interface SegmentFilter {
@@ -223,6 +230,8 @@ const PLAN_LIMITS: Record<
 };
 
 const DOMAIN_RE = /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+/** Consumer mailbox providers the API refuses as a domain suppression. */
+const PUBLIC_MAILBOX_DOMAINS = new Set(["gmail.com", "outlook.com", "yahoo.com"]);
 const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 class HttpError {
@@ -380,6 +389,18 @@ export async function startContractApi(
     }
     return rows;
   };
+
+  const suppressionItem = (s: SuppressionRow) => ({
+    id: s.id,
+    email: s.email,
+    kind: s.domain === undefined ? "email" : "domain",
+    domain: s.domain ?? null,
+    // A bounce or a complaint is permanent.
+    removable: s.origin === "manual",
+    origin: s.origin,
+    source_id: null,
+    created_at: s.createdAt,
+  });
 
   const domainItem = (d: DomainRow) => ({
     id: d.id,
@@ -733,7 +754,7 @@ export async function startContractApi(
       const own = [...store.domains.values()].filter((d) => !d.shared).length;
       if (limits.domains !== null && own >= limits.domains)
         fail(403, "plan_limit_reached", `Your plan allows up to ${limits.domains} domains`);
-      const returnPath = body.custom_return_path ?? "send";
+      const returnPath = body.custom_return_path ?? "bounce";
       if (!LABEL_RE.test(returnPath))
         fail(422, "validation_error", "custom_return_path: Invalid label");
       const row: DomainRow = {
@@ -763,6 +784,9 @@ export async function startContractApi(
       body: AnyBody;
     }) => {
       const d = store.domains.get(params.id ?? "") ?? notFound("Domain");
+      // The return path is fixed when the domain is added: any PATCH naming it is refused.
+      if ("custom_return_path" in body)
+        fail(422, "validation_error", "custom_return_path cannot be changed");
       const newHost =
         (!!body.tracking_subdomain && body.tracking_subdomain !== d.trackingSubdomain) ||
         (!!body.unsubscribe_subdomain && body.unsubscribe_subdomain !== d.unsubscribeSubdomain);
@@ -1239,25 +1263,38 @@ export async function startContractApi(
     // Suppressions
     "GET /suppressions": ({ url }) => {
       const origin = url.searchParams.get("origin");
-      const rows = [...store.suppressions.values()].filter((s) => !origin || s.origin === origin);
-      return listPage(rows, url, (s) => ({
-        id: s.id,
-        email: s.email,
-        origin: s.origin,
-        source_id: null,
-        created_at: s.createdAt,
-      }));
+      const kind = url.searchParams.get("kind") ?? "email";
+      const rows = [...store.suppressions.values()].filter(
+        (s) =>
+          (!origin || s.origin === origin) &&
+          (kind === "all" || (kind === "domain") === (s.domain !== undefined)),
+      );
+      return listPage(rows, url, suppressionItem);
     },
     "POST /suppressions/batch/add": ({ body }: { body: AnyBody }) => {
       const data: unknown[] = [];
       const seen = new Set<string>();
-      for (const email of body.emails as string[]) {
+      for (const email of (body.emails ?? []) as string[]) {
         const key = email.toLowerCase();
         if (seen.has(key)) continue;
         seen.add(key);
         let row = [...store.suppressions.values()].find((s) => s.email === key);
         if (!row) {
           row = { id: randomUUID(), email: key, origin: body.origin ?? "manual", createdAt: now() };
+          store.suppressions.set(row.id, row);
+        }
+        data.push({ object: "suppression", id: row.id });
+      }
+      // Domain entries follow the addresses' in the answer; they are manual entries.
+      for (const domain of (body.domains ?? []) as string[]) {
+        const key = domain.toLowerCase();
+        if (seen.has(`@${key}`)) continue;
+        seen.add(`@${key}`);
+        if (PUBLIC_MAILBOX_DOMAINS.has(key))
+          fail(422, "validation_error", `domains: ${key} is a public mailbox provider`);
+        let row = [...store.suppressions.values()].find((s) => s.domain === key);
+        if (!row) {
+          row = { id: randomUUID(), email: null, domain: key, origin: "manual", createdAt: now() };
           store.suppressions.set(row.id, row);
         }
         data.push({ object: "suppression", id: row.id });
@@ -1270,9 +1307,9 @@ export async function startContractApi(
       const ids = new Set<string>(body.ids ?? []);
       const emails = new Set<string>((body.emails ?? []).map((e: string) => e.toLowerCase()));
       for (const s of [...store.suppressions.values()]) {
-        if (!ids.has(s.id) && !emails.has(s.email)) continue;
+        if (!ids.has(s.id) && !(s.email !== null && emails.has(s.email))) continue;
         // A bounce or complaint entry is permanent: it stays and is listed in not_removed.
-        if (s.origin === "bounce" || s.origin === "complaint") {
+        if (!suppressionItem(s).removable) {
           notRemoved.push({
             object: "suppression",
             id: s.id,
