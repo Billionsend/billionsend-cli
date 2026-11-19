@@ -1,6 +1,6 @@
 {
   "name": "@billionsend/cli",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Migrate an email account to BillionSend: contacts, segments, topics, templates, webhooks, domains and suppressions — read from the source provider, written to your BillionSend account, re-run safe",
   "license": "MIT",
   "type": "module",
