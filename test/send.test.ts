@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { main } from "../src/index.js";
-import { runSend, splitAddresses, TEST_SEGMENT_NAME } from "../src/send.js";
+import { type Clock, runSend, splitAddresses, TEST_SEGMENT_NAME } from "../src/send.js";
 import { type ContractApi, startContractApi } from "./helpers/contract-api.js";
 
 /*
@@ -74,6 +74,21 @@ const members = (segmentId: string): string[] =>
     .filter((c) => api.store.segmentMembers.has(`${segmentId}:${c.id}`))
     .map((c) => c.email)
     .sort();
+
+/** A clock whose sleep runs `step` and moves time on by `advance` (default: the ms asked for). */
+function fakeClock(step: () => void, advance?: number): Clock & { slept: number[] } {
+  let now = 0;
+  const slept: number[] = [];
+  return {
+    slept,
+    now: () => now,
+    sleep: async (ms) => {
+      slept.push(ms);
+      now += advance ?? ms;
+      step();
+    },
+  };
+}
 
 const segmentNamed = (name: string) =>
   [...api.store.segments.values()].filter((s) => s.name === name);
@@ -386,33 +401,49 @@ describe("broadcasts send --test", () => {
 });
 
 describe("broadcasts send --wait and broadcasts get", () => {
-  it("--wait follows the broadcast until it is sent", async () => {
+  it("--wait follows the broadcast until it is sent, printing each change once", async () => {
     const { io, stdout } = ioFor();
     let polls = 0;
-    const code = await runSend(
-      [...SEND, "--segment", "Customers", "--yes", "--wait"],
-      io,
-      async () => {
-        polls++;
-        for (const b of api.store.broadcasts.values()) b.status = "sent";
-      },
-    );
+    const clock = fakeClock(() => {
+      polls++;
+      // Unchanged on the first poll, sent on the second.
+      if (polls === 2)
+        for (const b of api.store.broadcasts.values()) {
+          b.status = "sent";
+          b.sentCount = 2;
+        }
+    });
+    const code = await runSend([...SEND, "--segment", "Customers", "--yes", "--wait"], io, clock);
     expect(code).toBe(0);
-    expect(polls).toBe(1);
-    expect(stdout.text).toContain("status queued");
-    expect(stdout.text).toContain("status sent");
+    expect(clock.slept).toEqual([5_000, 5_000]);
+    expect(stdout.text.match(/status queued/g)).toHaveLength(1);
+    expect(stdout.text).toContain("status sent · sent 2");
+  });
+
+  it("--wait gives up after 30 minutes with exit 1 and says how to follow it", async () => {
+    const { io, stdout } = ioFor();
+    // Ten minutes pass on every sleep: the fourth read is past the 30 minutes.
+    const clock = fakeClock(() => {}, 10 * 60_000);
+    const code = await runSend([...SEND, "--segment", "Customers", "--yes", "--wait"], io, clock);
+    expect(code).toBe(1);
+    expect(clock.slept).toHaveLength(3);
+    const id = [...api.store.broadcasts.keys()][0];
+    expect(stdout.text).toContain(
+      `Still queued after 30 minutes; follow it with: billionsend broadcasts get ${id}`,
+    );
   });
 
   it("--wait ends with exit 1 when the broadcast fails", async () => {
-    const { io } = ioFor();
-    const code = await runSend(
-      [...SEND, "--segment", "Customers", "--yes", "--wait"],
-      io,
-      async () => {
-        for (const b of api.store.broadcasts.values()) b.status = "failed";
-      },
-    );
+    const { io, stdout } = ioFor();
+    const clock = fakeClock(() => {
+      for (const b of api.store.broadcasts.values()) {
+        b.status = "failed";
+        b.failureReason = "domain_not_verified";
+      }
+    });
+    const code = await runSend([...SEND, "--segment", "Customers", "--yes", "--wait"], io, clock);
     expect(code).toBe(1);
+    expect(stdout.text).toContain("status failed · domain_not_verified");
   });
 
   it("get prints the status, or the JSON", async () => {
@@ -507,5 +538,104 @@ describe("command line", () => {
     expect(splitAddresses([" A@x.io ,b@y.io", "a@x.io", ""])).toEqual(["a@x.io", "b@y.io"]);
     expect(splitAddresses(undefined)).toEqual([]);
     expect(() => splitAddresses(["a@x"])).toThrow("Not an email address: a@x");
+  });
+});
+
+describe("edges", () => {
+  it("finds a segment past the first page of the list", async () => {
+    for (let i = 0; i < 105; i++) await call("POST", "/segments", { name: `Filler ${i}` });
+    const last = await call<{ id: string }>("POST", "/segments", { name: "Late" });
+    await call("POST", "/contacts/batch?on_conflict=error", [
+      { email: "late@customer.test", segments: [{ id: last.id }] },
+    ]);
+    const result = await run([...SEND, "--segment", "Late", "--yes"]);
+    expect(result.code).toBe(0);
+    expect([...api.store.broadcasts.values()][0]?.segmentId).toBe(last.id);
+  });
+
+  it("says (none) when the account has no topic of that kind at all", async () => {
+    await call("DELETE", `/topics/${newsletter.id}`);
+    const result = await run([...SEND, "--segment", "Customers", "--topic", "Newsletter", "--yes"]);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('No topic "Newsletter". Existing topics:\n  (none)');
+  });
+
+  it("get shows a broadcast that has no name", async () => {
+    const created = await call<{ id: string }>("POST", "/broadcasts", {
+      from: "a@b.co",
+      subject: "x",
+      html: "<p>x</p>",
+      segment_id: customers.id,
+    });
+    const result = await run(["broadcasts", "get", created.id]);
+    expect(result.stdout).toBe(`${created.id} · status draft\n`);
+  });
+
+  it("emails send without --reply-to or a key sends neither, and --json prints the answer", async () => {
+    const result = await run([
+      "emails",
+      "send",
+      "--from",
+      "a@mail.example.com",
+      "--to",
+      "x@example.com",
+      "--subject",
+      "Hi",
+      "--html-file",
+      "mail.html",
+      "--yes",
+      "--json",
+    ]);
+    expect(result.code).toBe(0);
+    expect(api.store.emails[0]).not.toHaveProperty("reply_to");
+    expect(api.store.emails[0]?.idempotencyKey).toBeNull();
+    expect(JSON.parse(result.stdout)).toEqual({ id: api.store.emails[0]?.id });
+  });
+
+  it("emails send asks on a terminal and sends nothing on no", async () => {
+    const { io, stdin, stderr } = ioFor({ tty: true });
+    const pending = main(
+      [
+        "emails",
+        "send",
+        "--from",
+        "a@mail.example.com",
+        "--to",
+        "x@example.com",
+        "--subject",
+        "Hi",
+        "--html-file",
+        "mail.html",
+      ],
+      io,
+    );
+    stdin.end("\n");
+    expect(await pending).toBe(1);
+    expect(stderr.text).toContain("Not sent.");
+    expect(api.store.emails).toHaveLength(0);
+  });
+
+  it("refuses an empty line on stdin as the key", async () => {
+    const result = await run([...SEND, "--segment", "Customers", "--yes", "--key-stdin"], {
+      env: { BILLIONSEND_API_KEY: "" },
+      stdin: "\n",
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("No BillionSend API key arrived on stdin (--key-stdin).");
+  });
+
+  it("runs on the process streams when given none", async () => {
+    const write = process.stdout.write;
+    let printed = "";
+    process.stdout.write = ((chunk: string) => {
+      printed += chunk;
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      expect(await runSend(["broadcasts", "--help"])).toBe(0);
+    } finally {
+      process.stdout.write = write;
+    }
+    expect(printed).toContain("billionsend broadcasts send");
   });
 });

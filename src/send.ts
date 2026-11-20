@@ -2,7 +2,16 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { Io, OutStream } from "./context.js";
-import { ApiError, AuthError, createHttp, type Http, route } from "./http.js";
+import {
+  ApiError,
+  AuthError,
+  createHttp,
+  cursorGuard,
+  type Http,
+  nextCursor,
+  pageItems,
+  route,
+} from "./http.js";
 import { createLogger } from "./log.js";
 import { CLOUD_API_URL, USER_AGENT } from "./meta.js";
 import { lineReader } from "./tty-ui.js";
@@ -23,6 +32,17 @@ const SEND_RPS = 5;
 /** `--wait`: how often and how long to read the broadcast back. */
 const WAIT_POLL_MS = 5_000;
 const WAIT_LIMIT_MS = 30 * 60_000;
+
+/** Time, as `--wait` sees it; the tests pass their own. */
+export interface Clock {
+  now(): number;
+  sleep(ms: number): Promise<void>;
+}
+
+const SYSTEM_CLOCK: Clock = {
+  now: () => Date.now(),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+};
 const TERMINAL_STATUSES = new Set(["sent", "failed", "canceled", "cancelled"]);
 
 export const sendHelpText = (): string => `Sending
@@ -73,12 +93,10 @@ interface Topic {
 }
 interface Broadcast {
   id: string;
-  name?: string | null;
-  status?: string;
-  sent_count?: number | null;
-  failure_reason?: string | null;
-  segment_id?: string | null;
-  topic_id?: string | null;
+  name: string | null;
+  status: string;
+  sent_count: number | null;
+  failure_reason: string | null;
 }
 
 const OPTIONS = {
@@ -142,22 +160,22 @@ function readBody(io: SendIo, values: Values): { html?: string; text?: string } 
   const text = read("text-file");
   if (html === undefined && text === undefined)
     throw new UsageError("--html-file or --text-file is required.");
-  if ((html ?? text ?? "").trim() === "") throw new UsageError("The message body is empty.");
+  if (`${html ?? ""}${text ?? ""}`.trim() === "")
+    throw new UsageError("The message body is empty.");
   return { ...(html === undefined ? {} : { html }), ...(text === undefined ? {} : { text }) };
 }
 
 async function listAll<T extends { id: string }>(http: Http, path: string): Promise<T[]> {
   const rows: T[] = [];
+  const guard = cursorGuard(path);
   let after: string | undefined;
   for (;;) {
-    const { body } = await http.get<{ data?: T[]; has_more?: boolean }>(path, {
-      query: { limit: 100, after },
-    });
-    const page = body?.data ?? [];
+    const { body } = await http.get<{ has_more?: boolean }>(path, { query: { limit: 100, after } });
+    const page = pageItems<T>(path, body, after);
+    guard(page, after);
     rows.push(...page);
-    const last = page.at(-1);
-    if (!body?.has_more || last === undefined || last.id === after) return rows;
-    after = last.id;
+    if (body.has_more !== true) return rows;
+    after = nextCursor(path, page, after);
   }
 }
 
@@ -210,14 +228,11 @@ async function prepareTestSegment(http: Http, emails: string[]): Promise<Segment
       missing.map((email) => ({ email })),
       { query: { on_conflict: "skip" }, idempotent: true },
     );
-    for (const row of created.body.data) {
-      const email = missing[row.index];
-      if (email !== undefined) idByEmail.set(email, row.id);
-    }
+    // Strict batch validation (the default): it creates every row or fails as a whole.
+    for (const row of created.body.data) idByEmail.set(missing[row.index] as string, row.id);
   }
   for (const email of emails) {
-    const id = idByEmail.get(email);
-    if (id === undefined) throw new Error(`Could not create the contact ${email}.`);
+    const id = idByEmail.get(email) as string;
     if (!members.some((m) => m.id === id))
       await http.post(route`/contacts/${id}/segments/${segment.id}`, undefined, {
         idempotent: true,
@@ -242,25 +257,27 @@ async function confirm(io: SendIo, values: Values, question: string): Promise<bo
 }
 
 const describe = (b: Broadcast): string =>
-  `status ${b.status ?? "?"}${b.sent_count != null ? ` · sent ${b.sent_count}` : ""}${
+  `status ${b.status}${b.sent_count === null ? "" : ` · sent ${b.sent_count}`}${
     b.failure_reason ? ` · ${b.failure_reason}` : ""
   }`;
 
+/** Reads the broadcast back until it ends (sent, failed, canceled) or WAIT_LIMIT_MS has passed. */
 async function waitFor(
   http: Http,
   id: string,
   say: (line: string) => void,
-  sleep: (ms: number) => Promise<void>,
-): Promise<Broadcast> {
-  const deadline = Date.now() + WAIT_LIMIT_MS;
+  clock: Clock,
+): Promise<{ broadcast: Broadcast; ended: boolean }> {
+  const deadline = clock.now() + WAIT_LIMIT_MS;
   let last = "";
   for (;;) {
     const { body } = await http.get<Broadcast>(route`/broadcasts/${id}`);
     const line = describe(body);
     if (line !== last) say(`  ${line}`);
     last = line;
-    if (TERMINAL_STATUSES.has(body.status ?? "") || Date.now() > deadline) return body;
-    await sleep(WAIT_POLL_MS);
+    const ended = TERMINAL_STATUSES.has(body.status);
+    if (ended || clock.now() >= deadline) return { broadcast: body, ended };
+    await clock.sleep(WAIT_POLL_MS);
   }
 }
 
@@ -268,38 +285,41 @@ async function broadcastsSend(
   io: SendIo,
   http: Http,
   values: Values,
-  sleep: (ms: number) => Promise<void>,
+  clock: Clock,
 ): Promise<number> {
   const from = required(values, "from");
   const subject = required(values, "subject");
   const body = readBody(io, values);
   const test = splitAddresses(values.test);
-  if (test.length === 0 && !values.segment)
+  const segmentRef = values.segment;
+  if (test.length === 0 && !segmentRef)
     throw new UsageError("--segment is required (or --test <email> for a test send).");
   const say = (line: string) => (values.json ? io.stderr : io.stdout).write(`${line}\n`);
 
   const topic = values.topic
     ? await resolveNamed<Topic>(http, "/topics", "topic", values.topic)
     : null;
+  // Resolved for a test too, so a typo in the segment fails the test as it would the send.
+  const named = segmentRef
+    ? await resolveNamed<Segment>(http, "/segments", "segment", segmentRef)
+    : null;
   let segment: Segment;
   let question: string;
   if (test.length > 0) {
-    // Resolve the real segment first when one is named, so a typo fails the test too.
-    if (values.segment) await resolveNamed<Segment>(http, "/segments", "segment", values.segment);
     segment = await prepareTestSegment(http, test);
     question = `Send a test to ${test.join(", ")}?`;
   } else {
-    segment = await resolveNamed<Segment>(http, "/segments", "segment", values.segment ?? "");
-    const { body: detail } = await http.get<{ contact_count?: number }>(
+    // No --test means --segment was given (checked above).
+    segment = named as Segment;
+    const { body: detail } = await http.get<{ contact_count: number }>(
       route`/segments/${segment.id}`,
     );
-    const count = detail?.contact_count;
     say(
-      `Segment ${segment.name} (${segment.id}) · ${count ?? "?"} contacts${
+      `Segment ${segment.name} (${segment.id}) · ${detail.contact_count} contacts${
         topic ? ` · topic ${topic.name}: only its subscribers receive it` : ""
       }`,
     );
-    question = `Send "${subject}" to segment ${segment.name}${count === undefined ? "" : ` (${count} contacts)`}?`;
+    question = `Send "${subject}" to segment ${segment.name} (${detail.contact_count} contacts)?`;
   }
   if (!(await confirm(io, values, question))) {
     say("Not sent.");
@@ -323,12 +343,24 @@ async function broadcastsSend(
   );
   const id = created.body.id;
   say(`Broadcast ${id} queued${test.length > 0 ? ` (test to ${test.join(", ")})` : ""}.`);
-  const result = values.wait
-    ? await waitFor(http, id, say, sleep)
-    : (await http.get<Broadcast>(route`/broadcasts/${id}`)).body;
-  if (!values.wait) say(`  ${describe(result)}`);
-  if (values.json) io.stdout.write(`${JSON.stringify(result)}\n`);
-  return result.status === "failed" ? 1 : 0;
+  let result: Broadcast;
+  let gaveUp = false;
+  if (values.wait) {
+    const waited = await waitFor(http, id, say, clock);
+    result = waited.broadcast;
+    gaveUp = !waited.ended;
+    if (gaveUp)
+      say(
+        `Still ${result.status} after 30 minutes; follow it with: billionsend broadcasts get ${id}`,
+      );
+  } else {
+    result = (await http.get<Broadcast>(route`/broadcasts/${id}`)).body;
+    say(`  ${describe(result)}`);
+  }
+  if (values.json)
+    io.stdout.write(`${JSON.stringify(result)}
+`);
+  return result.status === "failed" || gaveUp ? 1 : 0;
 }
 
 async function broadcastsGet(io: SendIo, http: Http, values: Values, id: string | undefined) {
@@ -388,7 +420,7 @@ async function readKey(io: SendIo, values: Values): Promise<string> {
 export async function runSend(
   argv: readonly string[],
   ioIn: Io = {},
-  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+  clock: Clock = SYSTEM_CLOCK,
 ): Promise<number> {
   const io: SendIo = {
     stdout: ioIn.stdout ?? process.stdout,
@@ -432,7 +464,7 @@ export async function runSend(
     });
     if (command === "emails") return await emailsSend(io, http, values);
     if (sub === "get") return await broadcastsGet(io, http, values, id);
-    return await broadcastsSend(io, http, values, sleep);
+    return await broadcastsSend(io, http, values, clock);
   } catch (error) {
     if (error instanceof UsageError || error instanceof AuthError || error instanceof ApiError) {
       log.error(error.message);

@@ -140,6 +140,9 @@ export interface Store {
       text: string | null;
       status: string;
       createdAt: string;
+      /** Set by a test to stand for the send's progress or its failure. */
+      sentCount?: number;
+      failureReason?: string;
     }
   >;
   suppressions: Map<string, SuppressionRow>;
@@ -451,9 +454,9 @@ export async function startContractApi(
     created_at: b.createdAt,
     scheduled_at: null,
     sent_at: null,
-    failure_reason: null,
+    failure_reason: b.failureReason ?? null,
     failed_at: null,
-    sent_count: null,
+    sent_count: b.sentCount ?? null,
     finishes_at: null,
   });
 
