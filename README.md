@@ -27,6 +27,28 @@ Node 18 or newer; no dependencies.
 
 Audiences (deprecated in Resend) are skipped — segments cover them.
 
+## Sending
+
+The same `BILLIONSEND_API_KEY` sends from the command line. A broadcast goes to a segment, and to a topic's subscribers only when `--topic` is given; segments and topics are named by name or id.
+
+```bash
+export BILLIONSEND_API_KEY=bs_...
+
+# Test first: the same broadcast, to these addresses only
+billionsend broadcasts send --from "Leo <leo@mail.example.com>" --subject "Black Friday" \
+  --html-file black-friday.html --segment Customers --topic Newsletter \
+  --test you@example.com,colleague@example.com --yes
+
+# Then the real send: shows the segment's contact count and asks before sending (--yes skips the question)
+billionsend broadcasts send --from "Leo <leo@mail.example.com>" --subject "Black Friday" \
+  --html-file black-friday.html --segment Customers --topic Newsletter --wait
+
+billionsend broadcasts get <id>
+billionsend emails send --from "Leo <leo@mail.example.com>" --to you@example.com --subject "Hi" --text-file hi.txt --yes
+```
+
+`--test` puts the test addresses in a segment named "CLI test recipients" that holds exactly them (contacts that do not exist yet are created; an existing contact's name, topics and unsubscribe state are left as they are) and sends the broadcast there with `[TEST]` before the subject, so a test goes through the real broadcast path: merge tags such as `{{{FIRST_NAME|there}}}` are filled per recipient and the unsubscribe link is the recipient's own. Without a terminal, sending needs `--yes`. `--wait` follows the broadcast until it is sent, failed or canceled; a small broadcast reads as sent within about five minutes of its last email. `billionsend broadcasts --help` lists every option.
+
 ## Environment
 
 | Variable               | Meaning                                                                                                                         |

@@ -8,6 +8,7 @@ import { status } from "./commands/status.js";
 import { type Config, ConfigError, helpText, parseConfig } from "./config.js";
 import { type Context, createContext, type Io } from "./context.js";
 import { VERSION } from "./meta.js";
+import { runSend, SEND_COMMANDS } from "./send.js";
 
 const COMMANDS: Record<
   Exclude<Config["command"], "help" | "version">,
@@ -16,6 +17,7 @@ const COMMANDS: Record<
 
 /** The CLI as a function: the tests run it in-process with their own streams, env and cwd. */
 export async function main(argv = process.argv.slice(2), io: Io = {}): Promise<number> {
+  if ((SEND_COMMANDS as readonly string[]).includes(argv[0] ?? "")) return runSend(argv, io);
   const stdout = io.stdout ?? process.stdout;
   const stderr = io.stderr ?? process.stderr;
   let config: Config;

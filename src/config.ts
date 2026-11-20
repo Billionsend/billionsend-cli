@@ -2,6 +2,7 @@ import { parseArgs } from "node:util";
 import { CLOUD_API_URL, TRADEMARK_NOTICE, VERSION } from "./meta.js";
 import { PROVIDERS, type ProviderId, RESOURCES, type Resource } from "./model.js";
 import { providers } from "./providers/index.js";
+import { sendHelpText } from "./send.js";
 import { COLOR_MODES, type ColorMode } from "./theme.js";
 import { stripTrailingSlashes } from "./utils.js";
 
@@ -371,6 +372,7 @@ Usage
   billionsend migrate apply [plan.json] [--yes]              apply a saved plan (with the options it was made with), or plan and apply in one go
   billionsend migrate status                                 what the last run created and what is left
   billionsend migrate rollback [--yes]                       delete only what this tool created
+  billionsend broadcasts send | broadcasts get | emails send  send from the command line (see Sending below)
   billionsend --help | --version
 
 Options
@@ -405,6 +407,7 @@ Options
 Resources
   ${RESOURCES.join(", ")}
 
+${sendHelpText()}
 Environment
   RESEND_API_KEY             source API key (full access; the tool only reads from Resend)
   ${TARGET_KEY_ENV}        BillionSend API key (full access)

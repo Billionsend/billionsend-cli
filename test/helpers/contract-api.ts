@@ -143,6 +143,8 @@ export interface Store {
     }
   >;
   suppressions: Map<string, SuppressionRow>;
+  /** POST /emails bodies as accepted, with the id answered. */
+  emails: ({ id: string } & Record<string, unknown>)[];
 }
 
 interface SegmentFilter {
@@ -271,6 +273,7 @@ export async function startContractApi(
     templates: new Map(),
     broadcasts: new Map(),
     suppressions: new Map(),
+    emails: [],
   };
   const violations: string[] = [];
   const served = new Set<string>();
@@ -935,6 +938,25 @@ export async function startContractApi(
         created_at: row.createdAt,
       };
     },
+    "GET /segments/{id}": ({ params }) => {
+      const s = store.segments.get(params.id ?? "") ?? notFound("Segment");
+      return {
+        object: "segment",
+        id: s.id,
+        name: s.name,
+        domain_id: null,
+        filter: s.filter,
+        created_at: s.createdAt,
+        contact_count: [...store.segmentMembers].filter((m) => m.startsWith(`${s.id}:`)).length,
+      };
+    },
+    "GET /segments/{id}/contacts": ({ params, url }) => {
+      const s = store.segments.get(params.id ?? "") ?? notFound("Segment");
+      const members = [...store.contacts.values()].filter((c) =>
+        store.segmentMembers.has(`${s.id}:${c.id}`),
+      );
+      return listPage(members, url, contactItem);
+    },
     "PATCH /segments/{id}": ({
       params,
       body,
@@ -1157,9 +1179,12 @@ export async function startContractApi(
         previewText: (body.preview_text ?? null) as string | null,
         html: (body.html ?? null) as string | null,
         text: (body.text ?? null) as string | null,
-        status: "draft",
+        // send: true queues it at once, as the API does.
+        status: body.send === true ? "queued" : "draft",
         createdAt: now(),
       };
+      if (body.send === true && row.segmentId === null)
+        fail(422, "validation_error", "segment_id is required to send");
       store.broadcasts.set(row.id, row);
       return { id: row.id };
     },
@@ -1252,6 +1277,29 @@ export async function startContractApi(
       for (const e of entries) subs.set(e.id, e.subscription === "opt_in");
       store.topicSubscriptions.set(c.id, subs);
       return { id: c.id };
+    },
+    "DELETE /contacts/{id}/segments/{segmentId}": ({ params }) => {
+      const c = store.contacts.get(params.id ?? "") ?? notFound("Contact");
+      const s = store.segments.get(params.segmentId ?? "") ?? notFound("Segment");
+      store.segmentMembers.delete(`${s.id}:${c.id}`);
+      return { id: c.id, audienceId: s.id, deleted: true };
+    },
+    "POST /emails": ({
+      body,
+      headers,
+    }: {
+      body: AnyBody;
+      headers: Record<string, string | undefined>;
+    }) => {
+      if (body.html === undefined && body.text === undefined)
+        fail(422, "validation_error", "Either html or text must be provided");
+      const id = randomUUID();
+      store.emails.push({
+        id,
+        idempotencyKey: headers["idempotency-key"] ?? null,
+        ...(body as Record<string, unknown>),
+      });
+      return { id };
     },
     "POST /contacts/{id}/segments/{segmentId}": ({ params }) => {
       const c = store.contacts.get(params.id ?? "") ?? notFound("Contact");
@@ -1459,7 +1507,9 @@ export async function startContractApi(
     count: (table) =>
       table === "topicSubscriptions"
         ? [...store.topicSubscriptions.values()].reduce((n, subs) => n + subs.size, 0)
-        : store[table].size,
+        : table === "emails"
+          ? store.emails.length
+          : store[table].size,
     stop: async () => {
       live.delete(api);
       server.closeAllConnections();
