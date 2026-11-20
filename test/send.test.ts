@@ -1,10 +1,17 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { main } from "../src/index.js";
-import { type Clock, runSend, splitAddresses, TEST_SEGMENT_NAME } from "../src/send.js";
+import {
+  type Clock,
+  RECIPIENT_TYPES,
+  recipientsCsv,
+  runSend,
+  splitAddresses,
+  TEST_SEGMENT_NAME,
+} from "../src/send.js";
 import { type ContractApi, startContractApi } from "./helpers/contract-api.js";
 
 /*
@@ -637,5 +644,333 @@ describe("edges", () => {
       process.stdout.write = write;
     }
     expect(printed).toContain("billionsend broadcasts send");
+  });
+});
+
+describe("broadcasts send --wait-timeout", () => {
+  it("waits as many minutes as asked before giving up", async () => {
+    const { io, stdout } = ioFor();
+    const clock = fakeClock(() => {}, 30 * 60_000);
+    const code = await runSend(
+      [...SEND, "--segment", "Customers", "--yes", "--wait", "--wait-timeout", "90"],
+      io,
+      clock,
+    );
+    expect(code).toBe(1);
+    // Reads at 0, 30, 60 and 90 minutes.
+    expect(clock.slept).toHaveLength(3);
+    expect(stdout.text).toContain("Still queued after 90 minutes");
+  });
+
+  it.each(["0", "-0.5", "abc", "1441"])("refuses --wait-timeout %s before sending", async (raw) => {
+    const result = await run([...SEND, "--segment", "Customers", "--yes", `--wait-timeout=${raw}`]);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("--wait-timeout takes minutes");
+    expect(api.store.broadcasts.size).toBe(0);
+  });
+});
+
+describe("segments", () => {
+  it("create makes a segment and prints its id", async () => {
+    const result = await run(["segments", "create", "--name", "  BF last call  "]);
+    expect(result.code).toBe(0);
+    const [made] = segmentNamed("BF last call");
+    expect(made).toBeDefined();
+    expect(result.stdout).toBe(`Segment ${made?.id} created (BF last call).\n`);
+    const json = await run(["segments", "create", "--name", "Other", "--json"]);
+    expect(JSON.parse(json.stdout)).toMatchObject({ object: "segment", name: "Other" });
+  });
+
+  it("create needs a name", async () => {
+    const result = await run(["segments", "create", "--name", " "]);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("--name is required.");
+  });
+
+  it("get prints the contact count, by id or by name", async () => {
+    const byId = await run(["segments", "get", customers.id]);
+    expect(byId.stdout).toBe(`Customers · ${customers.id} · 2 contacts\n`);
+    const byName = await run(["segments", "get", "Customers", "--json"]);
+    expect(JSON.parse(byName.stdout)).toMatchObject({ id: customers.id, contact_count: 2 });
+    expect((await run(["segments", "get"])).stderr).toContain("Usage: billionsend segments get");
+  });
+});
+
+describe("contacts import", () => {
+  const writeCsv = (name: string, text: string) => writeFileSync(join(dir, name), text);
+
+  it("uploads the CSV into a segment, follows the import and prints the counts", async () => {
+    writeCsv("list.csv", "Email,First name\nnew@buyer.test,Ann\na@customer.test,Bo\n");
+    const { io, stdout } = ioFor();
+    const clock = fakeClock(() => {});
+    const code = await runSend(
+      ["contacts", "import", "--file", "list.csv", "--segment", "Customers"],
+      io,
+      clock,
+    );
+    expect(code).toBe(0);
+    expect(clock.slept).toEqual([2_000]);
+    expect(members(customers.id)).toEqual(["a@customer.test", "b@customer.test", "new@buyer.test"]);
+    expect(stdout.text).toContain("into segment Customers");
+    expect(stdout.text).toContain(
+      "status completed · 2 rows · 1 created · 1 updated · 0 skipped · 0 failed",
+    );
+    const sent = api.bodies.find((b) => b.operation === "POST /contacts/imports")?.body;
+    expect(sent).toMatchObject({ segments: JSON.stringify([{ id: customers.id }]) });
+    expect(sent).not.toHaveProperty("on_conflict");
+  });
+
+  it("passes --on-conflict skip and exits 3 when some rows failed", async () => {
+    writeCsv("list.csv", "email\na@customer.test\nnot-an-address\n");
+    const { io } = ioFor();
+    const code = await runSend(
+      ["contacts", "import", "--file", "list.csv", "--on-conflict", "skip", "--json"],
+      io,
+      fakeClock(() => {}),
+    );
+    expect(code).toBe(3);
+    const sent = api.bodies.find((b) => b.operation === "POST /contacts/imports")?.body;
+    expect(sent).toMatchObject({ on_conflict: "skip" });
+    expect(sent).not.toHaveProperty("segments");
+  });
+
+  it("prints the import as JSON on stdout with --json", async () => {
+    writeCsv("list.csv", "email\nz@buyer.test\n");
+    const { io, stdout } = ioFor();
+    expect(
+      await runSend(
+        ["contacts", "import", "--file", "list.csv", "--json"],
+        io,
+        fakeClock(() => {}),
+      ),
+    ).toBe(0);
+    expect(JSON.parse(stdout.text)).toMatchObject({
+      object: "contact_import",
+      status: "completed",
+      counts: { total: 1, created: 1 },
+    });
+  });
+
+  it("exits 1 when the import fails", async () => {
+    writeCsv("bad.csv", "name\nAnn\n");
+    const { io, stdout } = ioFor();
+    expect(
+      await runSend(
+        ["contacts", "import", "--file", "bad.csv"],
+        io,
+        fakeClock(() => {}),
+      ),
+    ).toBe(1);
+    expect(stdout.text).toContain("status failed");
+  });
+
+  it("gives up at --wait-timeout and says the import is still running", async () => {
+    writeCsv("list.csv", "email\nz@buyer.test\n");
+    const { io, stdout } = ioFor();
+    const code = await runSend(
+      ["contacts", "import", "--file", "list.csv", "--wait-timeout", "1"],
+      io,
+      // The import never settles; two minutes pass on each sleep.
+      fakeClock(() => {
+        for (const job of api.store.imports.values()) job.reads = -100;
+      }, 120_000),
+    );
+    expect(code).toBe(1);
+    expect(stdout.text).toContain("Still in_progress after 1 minutes.");
+  });
+
+  it.each([
+    [["--on-conflict", "replace", "--file", "list.csv"], "--on-conflict takes upsert or skip."],
+    [[], "--file is required."],
+    [["--file", "missing.csv"], "Cannot read --file missing.csv"],
+  ])("refuses %j before uploading", async (args, message) => {
+    writeCsv("list.csv", "email\nz@buyer.test\n");
+    const result = await run(["contacts", "import", ...args]);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(message);
+    expect(api.store.imports.size).toBe(0);
+  });
+
+  it("refuses a file over 20 MiB before uploading", async () => {
+    writeCsv("big.csv", "");
+    truncateSync(join(dir, "big.csv"), 20 * 1024 * 1024 + 1);
+    const result = await run(["contacts", "import", "--file", "big.csv"]);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("big.csv is larger than 20 MiB");
+    expect(api.store.imports.size).toBe(0);
+  });
+});
+
+describe("broadcasts recipients", () => {
+  const seed = async (type: string, n: number) => {
+    const b = await call<{ id: string }>("POST", "/broadcasts", {
+      name: "BF",
+      from: "a@b.co",
+      subject: "x",
+      html: "<p>x</p>",
+      segment_id: customers.id,
+    });
+    const rows = Array.from({ length: n }, (_, i) => ({
+      id: crypto.randomUUID(),
+      contactId: crypto.randomUUID(),
+      email: `r${String(i).padStart(3, "0")}@example.com`,
+      count: 1,
+      ...(type === "clicked"
+        ? { clickedLinks: [{ url: "https://billionverify.com/black-friday", clicks: 2 }] }
+        : {}),
+      createdAt: new Date(Date.UTC(2026, 10, 20, 0, 0, i)).toISOString(),
+    }));
+    api.store.recipients.set(b.id, { [type]: rows });
+    return b.id;
+  };
+
+  it("--all walks every page and prints CSV", async () => {
+    const id = await seed("opened", 230);
+    const result = await run(["broadcasts", "recipients", id, "--type", "opened", "--all"]);
+    expect(result.code).toBe(0);
+    const lines = result.stdout.trim().split("\n");
+    expect(lines[0]).toBe("email,contact_id,email_id,count,clicked_links,bounce_type");
+    expect(lines).toHaveLength(231);
+    expect(new Set(lines.slice(1).map((l) => l.split(",")[0])).size).toBe(230);
+    expect(result.stderr).toBe("230 opened recipients.\n");
+    const pages = api.bodies.filter((b) => b.operation === "GET /broadcasts/{id}/recipients");
+    expect(pages).toHaveLength(3);
+  });
+
+  it("without --all reads one page and says more remain", async () => {
+    const id = await seed("opened", 101);
+    const result = await run(["broadcasts", "recipients", id, "--type", "opened"]);
+    expect(result.stdout.trim().split("\n")).toHaveLength(101);
+    expect(result.stderr).toBe("100 opened recipients; more remain, pass --all for every page.\n");
+  });
+
+  it("prints JSON with --format json or --json, clicked links included", async () => {
+    const id = await seed("clicked", 1);
+    const viaFormat = await run([
+      "broadcasts",
+      "recipients",
+      id,
+      "--type",
+      "clicked",
+      "--format",
+      "json",
+    ]);
+    const viaJson = await run(["broadcasts", "recipients", id, "--type", "clicked", "--json"]);
+    expect(viaFormat.stdout).toBe(viaJson.stdout);
+    const [row] = JSON.parse(viaFormat.stdout) as { clicked_links: unknown }[];
+    expect(row?.clicked_links).toEqual([
+      { url: "https://billionverify.com/black-friday", clicks: 2 },
+    ]);
+    expect(viaFormat.stderr).toBe("1 clicked recipient.\n");
+  });
+
+  it.each([
+    [["--type", "read"], "--type is one of: "],
+    [[], "--type is one of: "],
+    [["--type", "opened", "--format", "xml"], "--format takes csv or json."],
+  ])("refuses %j", async (args, message) => {
+    const id = await seed("opened", 1);
+    const result = await run(["broadcasts", "recipients", id, ...args]);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(message);
+  });
+
+  it("needs a broadcast id", async () => {
+    const result = await run(["broadcasts", "recipients", "--type", "opened"]);
+    expect(result.stderr).toContain("Usage: billionsend broadcasts recipients <id>");
+  });
+
+  it("lists every type the API documents", () => {
+    expect(RECIPIENT_TYPES).toEqual([
+      "sent",
+      "delivered",
+      "opened",
+      "clicked",
+      "bounced",
+      "complained",
+      "unsubscribed",
+      "suppressed",
+    ]);
+  });
+
+  it("quotes CSV fields that hold commas, quotes or line breaks, and leaves the rest bare", () => {
+    expect(
+      recipientsCsv([
+        {
+          id: "e1",
+          contact_id: null,
+          email: "a@x.io",
+          clicked_links: [
+            { url: 'https://x.io/?a=1,b="2"', clicks: 1 },
+            { url: "https://x.io/b", clicks: 3 },
+          ],
+          bounce_type: "permanent",
+        },
+      ]),
+    ).toBe(
+      'email,contact_id,email_id,count,clicked_links,bounce_type\na@x.io,,e1,,"https://x.io/?a=1,b=""2"" (1); https://x.io/b (3)",permanent\n',
+    );
+  });
+});
+
+describe("broadcasts list", () => {
+  const make = (name: string) =>
+    call<{ id: string }>("POST", "/broadcasts", {
+      name,
+      from: "a@b.co",
+      subject: name,
+      html: "<p>x</p>",
+      segment_id: customers.id,
+    });
+
+  it("prints each broadcast's id, time, status and name, newest first", async () => {
+    const first = await make("First");
+    await new Promise((r) => setTimeout(r, 5));
+    const second = await make("Second");
+    const result = await run(["broadcasts", "list"]);
+    expect(result.code).toBe(0);
+    const lines = result.stdout.trim().split("\n");
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toMatch(
+      new RegExp(`^${second.id} · \\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2} · status draft · Second$`),
+    );
+    expect(lines[1]).toContain(first.id);
+    expect(result.stderr).toBe("");
+  });
+
+  it("reads one page of --limit and says more remain, or every page with --all", async () => {
+    for (let i = 0; i < 5; i++) await make(`B${i}`);
+    const page = await run(["broadcasts", "list", "--limit", "2"]);
+    expect(page.stdout.trim().split("\n")).toHaveLength(2);
+    expect(page.stderr).toBe("More broadcasts remain; pass --all for every page.\n");
+    const all = await run(["broadcasts", "list", "--limit", "2", "--all", "--json"]);
+    expect((JSON.parse(all.stdout) as unknown[]).length).toBe(5);
+    expect(all.stderr).toBe("");
+  });
+
+  it.each(["0", "101", "2.5", "x"])("refuses --limit %s", async (raw) => {
+    const result = await run(["broadcasts", "list", `--limit=${raw}`]);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("--limit takes a whole number from 1 to 100.");
+  });
+});
+
+describe("broadcasts send dormant options", () => {
+  it("sends dormant_check and include_dormant only when asked", async () => {
+    await run([...SEND, "--segment", "Customers", "--yes"]);
+    await run([
+      ...SEND,
+      "--segment",
+      "Customers",
+      "--yes",
+      "--no-dormant-check",
+      "--include-dormant",
+    ]);
+    const bodies = api.bodies
+      .filter((b) => b.operation === "POST /broadcasts")
+      .map((b) => b.body as Record<string, unknown>);
+    expect(bodies[0]).not.toHaveProperty("dormant_check");
+    expect(bodies[0]).not.toHaveProperty("include_dormant");
+    expect(bodies[1]).toMatchObject({ dormant_check: false, include_dormant: true });
   });
 });

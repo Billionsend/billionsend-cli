@@ -1,5 +1,5 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFileSync, statSync } from "node:fs";
+import { basename, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { Io, OutStream } from "./context.js";
 import {
@@ -18,20 +18,36 @@ import { lineReader } from "./tty-ui.js";
 import { stripTrailingSlashes } from "./utils.js";
 
 /**
- * Sending from the command line: `broadcasts send`, `broadcasts get` and
- * `emails send`, against the BillionSend API with BILLIONSEND_API_KEY. Kept
- * apart from `migrate`: no source provider, no state file, no plan.
+ * Working with an account from the command line: sending (`broadcasts send`,
+ * `emails send`), reading a broadcast and its recipients, segments and CSV
+ * imports, against the BillionSend API with BILLIONSEND_API_KEY. Kept apart
+ * from `migrate`: no source provider, no state file, no plan.
  */
 
-export const SEND_COMMANDS = ["broadcasts", "emails"] as const;
+export const SEND_COMMANDS = ["broadcasts", "emails", "segments", "contacts"] as const;
 export type SendCommand = (typeof SEND_COMMANDS)[number];
 
 /** The segment `--test` sends to; it holds exactly the --test addresses of the last test. */
 export const TEST_SEGMENT_NAME = "CLI test recipients";
 const SEND_RPS = 5;
-/** `--wait`: how often and how long to read the broadcast back. */
+/** `--wait`: how often to read the broadcast back; how long by default (--wait-timeout). */
 const WAIT_POLL_MS = 5_000;
-const WAIT_LIMIT_MS = 30 * 60_000;
+const DEFAULT_WAIT_MINUTES = 30;
+const MAX_WAIT_MINUTES = 24 * 60;
+/** `contacts import`: how often to read the import back. */
+const IMPORT_POLL_MS = 2_000;
+/** The API's limit for one CSV file. */
+const IMPORT_MAX_BYTES = 20 * 1024 * 1024;
+export const RECIPIENT_TYPES = [
+  "sent",
+  "delivered",
+  "opened",
+  "clicked",
+  "bounced",
+  "complained",
+  "unsubscribed",
+  "suppressed",
+] as const;
 
 /** Time, as `--wait` sees it; the tests pass their own. */
 export interface Clock {
@@ -45,11 +61,16 @@ const SYSTEM_CLOCK: Clock = {
 };
 const TERMINAL_STATUSES = new Set(["sent", "failed", "canceled", "cancelled"]);
 
-export const sendHelpText = (): string => `Sending
+export const sendHelpText = (): string => `Sending and the account
   billionsend broadcasts send --from <addr> --subject <s> --html-file <f> --segment <name|id> [options]
   billionsend broadcasts send ... --test <email> [--test <email>]   the same broadcast, to these addresses only
+  billionsend broadcasts list [--limit <n>] [--all]                 newest first, with each broadcast's id
   billionsend broadcasts get <id>
+  billionsend broadcasts recipients <id> --type <type> [--all] [--format csv|json]
   billionsend emails send --from <addr> --to <email> --subject <s> (--html-file <f> | --text-file <f>) [options]
+  billionsend segments create --name <name>
+  billionsend segments get <name|id>
+  billionsend contacts import --file <contacts.csv> [--segment <name|id>] [--on-conflict upsert|skip]
 
 Sending options
   --from <address>           sender, "Name <user@your-domain>"; the domain must be verified on BillionSend
@@ -62,11 +83,26 @@ Sending options
   --preview-text <text>      broadcasts: inbox preview line
   --reply-to <address>       repeatable
   --to <email>               emails: repeatable
+  --no-dormant-check         broadcasts: send the content to every contact. By default a contact who got 8 or more
+                             of your broadcasts and automation emails with no open or click for 120 days gets a short
+                             "still want these?" email instead (only where the domain tracks opens or clicks)
+  --include-dormant          broadcasts: also send to contacts marked dormant (they never answered that email)
   --test <email>             broadcasts: send to these addresses instead of the segment (repeatable or comma-separated).
                              They are put in a segment named "${TEST_SEGMENT_NAME}" holding exactly them, so the test
                              goes through the real broadcast path: names and unsubscribe links are each recipient's own
-  --wait                     broadcasts: follow the broadcast until it is sent, failed or canceled (30 min at most)
+  --wait                     broadcasts: follow the broadcast until it is sent, failed or canceled
+  --wait-timeout <minutes>   how long --wait and contacts import follow before giving up (default ${DEFAULT_WAIT_MINUTES}).
+                             A first send to new contacts is released in steps over about an hour: give it 90 or more
   --idempotency-key <key>    emails: a retry with the same key sends once
+  --type <type>              recipients: ${RECIPIENT_TYPES.join(", ")}
+  --all                      recipients, list: every page (default: one page)
+  --limit <n>                list: how many per page, 1-100 (default 20)
+  --format csv|json          recipients: output format (default csv; --json is the same as --format json)
+  --file <path>              contacts import: a CSV with a header row and an email column, at most 20 MiB;
+                             contacts who unsubscribed stay unsubscribed
+  --on-conflict upsert|skip  contacts import: update contacts the team already has from the file and add them to
+                             --segment (default; a column the file lacks keeps its value), or skip them entirely,
+                             segment included
   --key-stdin                read the BillionSend API key from stdin instead of BILLIONSEND_API_KEY
   -y, --yes                  send without asking; required when stdin is not a terminal
   --json                     JSON on stdout
@@ -112,6 +148,15 @@ const OPTIONS = {
   to: { type: "string", multiple: true },
   test: { type: "string", multiple: true },
   wait: { type: "boolean" },
+  "no-dormant-check": { type: "boolean" },
+  "include-dormant": { type: "boolean" },
+  limit: { type: "string" },
+  "wait-timeout": { type: "string" },
+  type: { type: "string" },
+  all: { type: "boolean" },
+  format: { type: "string" },
+  file: { type: "string" },
+  "on-conflict": { type: "string" },
   "idempotency-key": { type: "string" },
   "key-stdin": { type: "boolean" },
   "to-url": { type: "string" },
@@ -261,14 +306,27 @@ const describe = (b: Broadcast): string =>
     b.failure_reason ? ` · ${b.failure_reason}` : ""
   }`;
 
-/** Reads the broadcast back until it ends (sent, failed, canceled) or WAIT_LIMIT_MS has passed. */
+/** --wait-timeout in minutes: a positive number up to a day. */
+function waitMinutes(values: Values): number {
+  const raw = values["wait-timeout"];
+  if (raw === undefined) return DEFAULT_WAIT_MINUTES;
+  const minutes = Number(raw);
+  if (!(minutes > 0 && minutes <= MAX_WAIT_MINUTES))
+    throw new UsageError(
+      `--wait-timeout takes minutes, more than 0 and at most ${MAX_WAIT_MINUTES}.`,
+    );
+  return minutes;
+}
+
+/** Reads the broadcast back until it ends (sent, failed, canceled) or `minutes` have passed. */
 async function waitFor(
   http: Http,
   id: string,
   say: (line: string) => void,
   clock: Clock,
+  minutes: number,
 ): Promise<{ broadcast: Broadcast; ended: boolean }> {
-  const deadline = clock.now() + WAIT_LIMIT_MS;
+  const deadline = clock.now() + minutes * 60_000;
   let last = "";
   for (;;) {
     const { body } = await http.get<Broadcast>(route`/broadcasts/${id}`);
@@ -290,6 +348,7 @@ async function broadcastsSend(
   const from = required(values, "from");
   const subject = required(values, "subject");
   const body = readBody(io, values);
+  const minutes = waitMinutes(values);
   const test = splitAddresses(values.test);
   const segmentRef = values.segment;
   if (test.length === 0 && !segmentRef)
@@ -336,6 +395,8 @@ async function broadcastsSend(
       ...(topic ? { topic_id: topic.id } : {}),
       ...(values["reply-to"]?.length ? { reply_to: values["reply-to"] } : {}),
       ...(values["preview-text"] ? { preview_text: values["preview-text"] } : {}),
+      ...(values["no-dormant-check"] ? { dormant_check: false } : {}),
+      ...(values["include-dormant"] ? { include_dormant: true } : {}),
       ...body,
       send: true,
     },
@@ -346,20 +407,18 @@ async function broadcastsSend(
   let result: Broadcast;
   let gaveUp = false;
   if (values.wait) {
-    const waited = await waitFor(http, id, say, clock);
+    const waited = await waitFor(http, id, say, clock, minutes);
     result = waited.broadcast;
     gaveUp = !waited.ended;
     if (gaveUp)
       say(
-        `Still ${result.status} after 30 minutes; follow it with: billionsend broadcasts get ${id}`,
+        `Still ${result.status} after ${minutes} minutes; follow it with: billionsend broadcasts get ${id}`,
       );
   } else {
     result = (await http.get<Broadcast>(route`/broadcasts/${id}`)).body;
     say(`  ${describe(result)}`);
   }
-  if (values.json)
-    io.stdout.write(`${JSON.stringify(result)}
-`);
+  if (values.json) io.stdout.write(`${JSON.stringify(result)}\n`);
   return result.status === "failed" || gaveUp ? 1 : 0;
 }
 
@@ -399,6 +458,185 @@ async function emailsSend(io: SendIo, http: Http, values: Values): Promise<numbe
   return 0;
 }
 
+interface BroadcastListItem extends Broadcast {
+  created_at: string;
+}
+
+async function broadcastsList(io: SendIo, http: Http, values: Values): Promise<number> {
+  const limit = values.limit === undefined ? 20 : Number(values.limit);
+  if (!(Number.isInteger(limit) && limit >= 1 && limit <= 100))
+    throw new UsageError("--limit takes a whole number from 1 to 100.");
+  const path = "/broadcasts";
+  const rows: BroadcastListItem[] = [];
+  const guard = cursorGuard(path);
+  let after: string | undefined;
+  let more = false;
+  for (;;) {
+    const { body } = await http.get<{ has_more?: boolean }>(path, { query: { limit, after } });
+    const page = pageItems<BroadcastListItem>(path, body, after);
+    guard(page, after);
+    rows.push(...page);
+    more = body.has_more === true;
+    if (!more || !values.all) break;
+    after = nextCursor(path, page, after);
+  }
+  if (values.json) io.stdout.write(`${JSON.stringify(rows)}\n`);
+  else
+    for (const b of rows)
+      io.stdout.write(
+        `${b.id} · ${b.created_at.slice(0, 16).replace("T", " ")} · ${describe(b)}${b.name ? ` · ${b.name}` : ""}\n`,
+      );
+  if (more) io.stderr.write("More broadcasts remain; pass --all for every page.\n");
+  return 0;
+}
+
+interface SegmentDetail extends Segment {
+  contact_count: number;
+}
+
+async function segmentsCreate(io: SendIo, http: Http, values: Values): Promise<number> {
+  const name = values.name?.trim();
+  if (!name) throw new UsageError("--name is required.");
+  const { body } = await http.post<Segment>("/segments", { name }, { idempotent: false });
+  if (values.json) io.stdout.write(`${JSON.stringify(body)}\n`);
+  else io.stdout.write(`Segment ${body.id} created (${body.name}).\n`);
+  return 0;
+}
+
+async function segmentsGet(io: SendIo, http: Http, values: Values, ref: string | undefined) {
+  if (!ref) throw new UsageError("Usage: billionsend segments get <name|id>");
+  const segment = await resolveNamed<Segment>(http, "/segments", "segment", ref);
+  const { body } = await http.get<SegmentDetail>(route`/segments/${segment.id}`);
+  if (values.json) io.stdout.write(`${JSON.stringify(body)}\n`);
+  else io.stdout.write(`${body.name} · ${body.id} · ${body.contact_count} contacts\n`);
+  return 0;
+}
+
+interface ContactImport {
+  id: string;
+  status: "queued" | "in_progress" | "completed" | "failed";
+  counts: { total: number; created: number; updated: number; skipped: number; failed: number };
+}
+
+/** Exit 0 imported, 3 imported with rows that failed, 1 the import failed or is still running at the timeout. */
+async function contactsImport(
+  io: SendIo,
+  http: Http,
+  values: Values,
+  clock: Clock,
+): Promise<number> {
+  const path = values.file;
+  if (!path) throw new UsageError("--file is required.");
+  const onConflict = values["on-conflict"];
+  if (onConflict !== undefined && onConflict !== "upsert" && onConflict !== "skip")
+    throw new UsageError("--on-conflict takes upsert or skip.");
+  const minutes = waitMinutes(values);
+  const full = resolve(io.cwd, path);
+  let csv: Buffer;
+  try {
+    if (statSync(full).size > IMPORT_MAX_BYTES)
+      throw new UsageError(`${path} is larger than 20 MiB, the most one import takes.`);
+    csv = readFileSync(full);
+  } catch (error) {
+    if (error instanceof UsageError) throw error;
+    throw new UsageError(`Cannot read --file ${path}`);
+  }
+  const segment = values.segment
+    ? await resolveNamed<Segment>(http, "/segments", "segment", values.segment)
+    : null;
+  const form = new FormData();
+  form.set("file", new Blob([csv], { type: "text/csv" }), basename(full));
+  if (segment) form.set("segments", JSON.stringify([{ id: segment.id }]));
+  if (onConflict) form.set("on_conflict", onConflict);
+  const say = (line: string) => (values.json ? io.stderr : io.stdout).write(`${line}\n`);
+  const { body: started } = await http.post<{ id: string }>("/contacts/imports", form, {
+    idempotent: false,
+  });
+  say(`Import ${started.id} started${segment ? ` into segment ${segment.name}` : ""}.`);
+  const deadline = clock.now() + minutes * 60_000;
+  let job: ContactImport;
+  for (;;) {
+    job = (await http.get<ContactImport>(route`/contacts/imports/${started.id}`)).body;
+    if (job.status === "completed" || job.status === "failed" || clock.now() >= deadline) break;
+    await clock.sleep(IMPORT_POLL_MS);
+  }
+  const { total, created, updated, skipped, failed } = job.counts;
+  say(
+    `  status ${job.status} · ${total} rows · ${created} created · ${updated} updated · ${skipped} skipped · ${failed} failed`,
+  );
+  if (values.json) io.stdout.write(`${JSON.stringify(job)}\n`);
+  if (job.status === "completed") return failed > 0 ? 3 : 0;
+  if (job.status !== "failed") say(`Still ${job.status} after ${minutes} minutes.`);
+  return 1;
+}
+
+interface Recipient {
+  id: string;
+  contact_id: string | null;
+  email: string;
+  count?: number;
+  clicked_links?: { url: string; clicks: number }[];
+  bounce_type?: string;
+}
+
+/** One CSV field: quoted when it holds a comma, a quote or a line break. */
+const csvField = (value: string): string =>
+  /[",\r\n]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value;
+
+export function recipientsCsv(rows: readonly Recipient[]): string {
+  const lines = ["email,contact_id,email_id,count,clicked_links,bounce_type"];
+  for (const r of rows) {
+    lines.push(
+      [
+        r.email,
+        r.contact_id ?? "",
+        r.id,
+        r.count === undefined ? "" : String(r.count),
+        (r.clicked_links ?? []).map((l) => `${l.url} (${l.clicks})`).join("; "),
+        r.bounce_type ?? "",
+      ]
+        .map(csvField)
+        .join(","),
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+async function broadcastsRecipients(
+  io: SendIo,
+  http: Http,
+  values: Values,
+  id: string | undefined,
+): Promise<number> {
+  if (!id) throw new UsageError("Usage: billionsend broadcasts recipients <id> --type <type>");
+  const type = values.type;
+  if (!type || !(RECIPIENT_TYPES as readonly string[]).includes(type))
+    throw new UsageError(`--type is one of: ${RECIPIENT_TYPES.join(", ")}`);
+  const format = values.json ? "json" : (values.format ?? "csv");
+  if (format !== "csv" && format !== "json") throw new UsageError("--format takes csv or json.");
+  const path = route`/broadcasts/${id}/recipients`;
+  const rows: Recipient[] = [];
+  const guard = cursorGuard(path);
+  let after: string | undefined;
+  let more = false;
+  for (;;) {
+    const { body } = await http.get<{ has_more?: boolean }>(path, {
+      query: { type, limit: 100, after },
+    });
+    const page = pageItems<Recipient>(path, body, after);
+    guard(page, after);
+    rows.push(...page);
+    more = body.has_more === true;
+    if (!more || !values.all) break;
+    after = nextCursor(path, page, after);
+  }
+  io.stdout.write(format === "json" ? `${JSON.stringify(rows)}\n` : recipientsCsv(rows));
+  io.stderr.write(
+    `${rows.length} ${type} recipient${rows.length === 1 ? "" : "s"}${more ? "; more remain, pass --all for every page" : ""}.\n`,
+  );
+  return 0;
+}
+
 async function readKey(io: SendIo, values: Values): Promise<string> {
   if (values["key-stdin"]) {
     const rl = lineReader(io.stdin, io.stderr);
@@ -416,7 +654,28 @@ async function readKey(io: SendIo, values: Values): Promise<string> {
   return key;
 }
 
-/** `billionsend broadcasts …` / `billionsend emails …`. Exit 0 sent, 1 refused or failed. */
+type Run = (args: {
+  io: SendIo;
+  http: Http;
+  values: Values;
+  id: string | undefined;
+  clock: Clock;
+}) => Promise<number>;
+
+const COMMANDS: Record<string, Run> = {
+  "broadcasts send": ({ io, http, values, clock }) => broadcastsSend(io, http, values, clock),
+  "broadcasts get": ({ io, http, values, id }) => broadcastsGet(io, http, values, id),
+  "broadcasts list": ({ io, http, values }) => broadcastsList(io, http, values),
+  "broadcasts recipients": ({ io, http, values, id }) => broadcastsRecipients(io, http, values, id),
+  "emails send": ({ io, http, values }) => emailsSend(io, http, values),
+  "segments create": ({ io, http, values }) => segmentsCreate(io, http, values),
+  "segments get": ({ io, http, values, id }) => segmentsGet(io, http, values, id),
+  "contacts import": ({ io, http, values, clock }) => contactsImport(io, http, values, clock),
+};
+/** The commands that take one positional argument after the subcommand. */
+const TAKES_ID = new Set(["broadcasts get", "broadcasts recipients", "segments get"]);
+
+/** `billionsend broadcasts | emails | segments | contacts …`. Exit 0 done, 1 refused or failed, 3 partly imported. */
 export async function runSend(
   argv: readonly string[],
   ioIn: Io = {},
@@ -443,11 +702,10 @@ export async function runSend(
       io.stdout.write(sendHelpText());
       return values.help ? 0 : 1;
     }
-    const known =
-      (command === "broadcasts" && (sub === "send" || sub === "get")) ||
-      (command === "emails" && sub === "send");
-    if (!known) throw new UsageError(`Unknown command: ${command} ${sub}`);
-    if (rest.length > 0 || (id !== undefined && sub !== "get"))
+    const name = `${command} ${sub}`;
+    const run = COMMANDS[name];
+    if (!run) throw new UsageError(`Unknown command: ${name}`);
+    if (rest.length > 0 || (id !== undefined && !TAKES_ID.has(name)))
       throw new UsageError(`Unexpected argument: ${[id, ...rest].filter(Boolean).join(" ")}`);
     const token = await readKey(io, values);
     const baseUrl = stripTrailingSlashes(
@@ -462,9 +720,7 @@ export async function runSend(
       name: "BillionSend",
       fetch: io.fetch,
     });
-    if (command === "emails") return await emailsSend(io, http, values);
-    if (sub === "get") return await broadcastsGet(io, http, values, id);
-    return await broadcastsSend(io, http, values, clock);
+    return await run({ io, http, values, id, clock });
   } catch (error) {
     if (error instanceof UsageError || error instanceof AuthError || error instanceof ApiError) {
       log.error(error.message);

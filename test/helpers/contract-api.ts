@@ -140,6 +140,8 @@ export interface Store {
       text: string | null;
       status: string;
       createdAt: string;
+      dormantCheck: boolean;
+      includeDormant: boolean;
       /** Set by a test to stand for the send's progress or its failure. */
       sentCount?: number;
       failureReason?: string;
@@ -148,6 +150,35 @@ export interface Store {
   suppressions: Map<string, SuppressionRow>;
   /** POST /emails bodies as accepted, with the id answered. */
   emails: ({ id: string } & Record<string, unknown>)[];
+  /** CSV imports: in progress on the first read, then settled. */
+  imports: Map<
+    string,
+    {
+      id: string;
+      reads: number;
+      outcome: "completed" | "failed";
+      counts: { total: number; created: number; updated: number; skipped: number; failed: number };
+      createdAt: string;
+    }
+  >;
+  /** A broadcast's recipients by outcome type, as a test seeds them. */
+  recipients: Map<
+    string,
+    Partial<
+      Record<
+        string,
+        {
+          id: string;
+          contactId: string | null;
+          email: string;
+          count?: number;
+          clickedLinks?: { url: string; clicks: number }[];
+          bounceType?: "permanent" | "transient" | "undetermined";
+          createdAt: string;
+        }[]
+      >
+    >
+  >;
 }
 
 interface SegmentFilter {
@@ -277,6 +308,8 @@ export async function startContractApi(
     broadcasts: new Map(),
     suppressions: new Map(),
     emails: [],
+    imports: new Map(),
+    recipients: new Map(),
   };
   const violations: string[] = [];
   const served = new Set<string>();
@@ -432,6 +465,10 @@ export async function startContractApi(
       accent_color: null,
       logo_radius: null,
       logo_url: null,
+      support_url: null,
+      // Follows the team, which shows the "Powered by" line by default.
+      powered_by: null,
+      powered_by_effective: true,
     },
     capabilities: { sending: "enabled", receiving: "disabled" },
     receiving_catch_all: false,
@@ -1157,6 +1194,8 @@ export async function startContractApi(
         domain_id: null,
         html: b.html,
         text: b.text,
+        dormant_check: b.dormantCheck,
+        include_dormant: b.includeDormant,
       };
     },
     "POST /broadcasts": ({ body }: { body: AnyBody }) => {
@@ -1184,6 +1223,8 @@ export async function startContractApi(
         text: (body.text ?? null) as string | null,
         // send: true queues it at once, as the API does.
         status: body.send === true ? "queued" : "draft",
+        dormantCheck: body.dormant_check ?? true,
+        includeDormant: body.include_dormant ?? false,
         createdAt: now(),
       };
       if (body.send === true && row.segmentId === null)
@@ -1303,6 +1344,84 @@ export async function startContractApi(
         ...(body as Record<string, unknown>),
       });
       return { id };
+    },
+    "POST /contacts/imports": ({ body }: { body: AnyBody }) => {
+      if (typeof body?.file !== "string") fail(422, "validation_error", "file is required");
+      const segments = body.segments
+        ? (JSON.parse(body.segments) as { id: string }[]).map(
+            (ref) => store.segments.get(ref.id) ?? notFound("Segment"),
+          )
+        : [];
+      const [header = "", ...lines] = (body.file as string).split(/\r?\n/).filter((l) => l !== "");
+      const column = header
+        .split(",")
+        .map((h) => h.trim().toLowerCase())
+        .indexOf("email");
+      const counts = { total: lines.length, created: 0, updated: 0, skipped: 0, failed: 0 };
+      if (column >= 0) {
+        for (const line of lines) {
+          const email = line.split(",")[column]?.trim().toLowerCase() ?? "";
+          if (!email.includes("@")) {
+            counts.failed++;
+            continue;
+          }
+          let contact = [...store.contacts.values()].find((c) => c.email === email);
+          if (contact && body.on_conflict === "skip") {
+            counts.skipped++;
+            continue;
+          }
+          if (contact) counts.updated++;
+          else {
+            contact = {
+              id: randomUUID(),
+              email,
+              firstName: null,
+              lastName: null,
+              unsubscribed: false,
+              properties: {},
+              createdAt: now(),
+            };
+            store.contacts.set(contact.id, contact);
+            counts.created++;
+          }
+          for (const segment of segments) store.segmentMembers.add(`${segment.id}:${contact.id}`);
+        }
+      }
+      const row = {
+        id: randomUUID(),
+        reads: 0,
+        outcome: column >= 0 ? ("completed" as const) : ("failed" as const),
+        counts,
+        createdAt: now(),
+      };
+      store.imports.set(row.id, row);
+      return { object: "contact_import", id: row.id };
+    },
+    "GET /contacts/imports/{id}": ({ params }) => {
+      const row = store.imports.get(params.id ?? "") ?? notFound("Import");
+      row.reads++;
+      const settled = row.reads > 1;
+      return {
+        object: "contact_import",
+        id: row.id,
+        status: settled ? row.outcome : "in_progress",
+        created_at: row.createdAt,
+        completed_at: settled ? now() : null,
+        counts: row.counts,
+      };
+    },
+    "GET /broadcasts/{id}/recipients": ({ params, url }) => {
+      const b = store.broadcasts.get(params.id ?? "") ?? notFound("Broadcast");
+      const type = url.searchParams.get("type") ?? "";
+      const rows = store.recipients.get(b.id)?.[type] ?? [];
+      return listPage(rows, url, (r) => ({
+        id: r.id,
+        contact_id: r.contactId,
+        email: r.email,
+        ...(r.count === undefined ? {} : { count: r.count }),
+        ...(r.clickedLinks === undefined ? {} : { clicked_links: r.clickedLinks }),
+        ...(r.bounceType === undefined ? {} : { bounce_type: r.bounceType }),
+      }));
     },
     "POST /contacts/{id}/segments/{segmentId}": ({ params }) => {
       const c = store.contacts.get(params.id ?? "") ?? notFound("Contact");
@@ -1429,7 +1548,17 @@ export async function startContractApi(
       }
       const raw = await readBody(req);
       let body: unknown;
-      if (raw !== "") {
+      const contentType = headers["content-type"] ?? "";
+      if (contentType.startsWith("multipart/form-data")) {
+        // Fields as strings, a file as its text: what the import handler reads.
+        const form = await new Response(raw, {
+          headers: { "content-type": contentType },
+        }).formData();
+        const fields: Record<string, string> = {};
+        for (const [name, value] of form.entries())
+          fields[name] = typeof value === "string" ? value : await value.text();
+        body = fields;
+      } else if (raw !== "") {
         try {
           body = JSON.parse(raw);
         } catch {
@@ -1512,7 +1641,13 @@ export async function startContractApi(
         ? [...store.topicSubscriptions.values()].reduce((n, subs) => n + subs.size, 0)
         : table === "emails"
           ? store.emails.length
-          : store[table].size,
+          : table === "recipients"
+            ? [...store.recipients.values()].reduce(
+                (n, byType) =>
+                  n + Object.values(byType).reduce((m, rows) => m + (rows?.length ?? 0), 0),
+                0,
+              )
+            : store[table].size,
     stop: async () => {
       live.delete(api);
       server.closeAllConnections();

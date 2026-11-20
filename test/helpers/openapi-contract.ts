@@ -171,13 +171,17 @@ export function checkRequest(
     if (!known.has(name)) problems.push(`query parameter ${name} is not documented`);
   }
   const bodyProblems: string[] = [];
-  const content = matched.operation.requestBody?.content?.["application/json"];
+  // A multipart request is checked against the multipart schema, its fields parsed into an object.
+  const mediaType = headers["content-type"]?.startsWith("multipart/form-data")
+    ? "multipart/form-data"
+    : "application/json";
+  const content = matched.operation.requestBody?.content?.[mediaType];
   if (content?.schema) {
     if (!hasBody) {
       if (matched.operation.requestBody?.required) bodyProblems.push("body is required");
     } else {
       const validate = validatorAt(
-        `${matched.pointer}/requestBody/content/application~1json/schema`,
+        `${matched.pointer}/requestBody/content/${mediaType.replace("/", "~1")}/schema`,
       );
       // A batch (an operation taking x-batch-validation) checks each item itself, so that header
       // can decide between failing the batch and listing the item: item errors are its handler's.

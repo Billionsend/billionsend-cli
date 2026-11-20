@@ -359,7 +359,10 @@ export function createHttp(options: HttpOptions): HttpClient {
       authorization: `Bearer ${options.token}`,
       "user-agent": options.userAgent,
       accept: "application/json",
-      ...(body === undefined ? {} : { "content-type": "application/json" }),
+      // A FormData body sets its own multipart content type, boundary included.
+      ...(body === undefined || body instanceof FormData
+        ? {}
+        : { "content-type": "application/json" }),
       ...extraHeaders,
     };
     for (const [header, value] of Object.entries(headers)) {
@@ -372,7 +375,9 @@ export function createHttp(options: HttpOptions): HttpClient {
     const init: RequestInit = {
       method,
       headers,
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(body === undefined
+        ? {}
+        : { body: body instanceof FormData ? body : JSON.stringify(body) }),
     };
 
     const repeatable = idempotent || REPEATABLE_METHODS.has(method);
